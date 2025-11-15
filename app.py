@@ -19,8 +19,8 @@ def bcd_to_int(b: int) -> int:
 
 def parse_device_datetime(tokens: List[str], idx: int) -> datetime:
     """
-    Decode a timestamp from tokens:
-    YY MM DD hh mm ss   (each 1 byte, hex printed)
+    Decode a timestamp from tokens that have:
+    YY MM DD hh mm ss   (each 1 byte, hex)
     """
     yy = int(tokens[idx], 16)
     mm = int(tokens[idx + 1], 16)
@@ -97,24 +97,46 @@ def parse_log_text(text: str):
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # 55 – HR
+        # 55 – HR (može biti više 55 paketa u jednoj liniji)
         elif cmd == "55":
-            # 55 id1 id2 YY MM DD hh mm ss HR
-            if len(tokens) < 10:
-                continue
-            dt = parse_device_datetime(tokens, 3)
-            hr = int(tokens[-1], 16)
-            hr_samples.append(HrSample(t=dt, hr=hr))
+            # format iz tvojih logova:
+            # 55 idx1 idx2 YY MM DD HH MM HR CRC
+            j = 0
+            while j < len(tokens):
+                if tokens[j] != "55":
+                    j += 1
+                    continue
+                # trebamo barem 10 tokena od ove pozicije
+                if j + 9 >= len(tokens):
+                    break
+                try:
+                    yy = int(tokens[j + 3], 16)
+                    mm = int(tokens[j + 4], 16)
+                    dd = int(tokens[j + 5], 16)
+                    hh = int(tokens[j + 6], 16)
+                    mi = int(tokens[j + 7], 16)
+                    year = 2000 + bcd_to_int(yy)
+                    month = bcd_to_int(mm)
+                    day = bcd_to_int(dd)
+                    hour = bcd_to_int(hh)
+                    minute = bcd_to_int(mi)
+                    dt = datetime(year, month, day, hour, minute, 0)
+                    hr_val = int(tokens[j + 8], 16)  # HR je pretposljednji bajt
+                    hr_samples.append(HrSample(t=dt, hr=hr_val))
+                except Exception:
+                    pass
+                j += 10
 
         # 56 – HRV
         elif cmd == "56":
+            # 56 00 00 YY MM DD hh mm ss ... ; ovdje imamo punih 6 byte za vrijeme
             if len(tokens) < 11:
                 continue
             dt = parse_device_datetime(tokens, 3)
-            hrv_val = int(tokens[9], 16)
+            hrv_val = int(tokens[9], 16)  # heuristika – jedan od bajtova kao HRV index
             hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
 
-        # 52 – ignoriramo za sada
+        # 52 – steps (ignoriramo za sad)
 
     return sleep_minutes, hr_samples, hrv_samples
 
@@ -344,7 +366,7 @@ def main():
 
     df = build_dataframe(session)
 
-    # -------- TIME SLIDER FIX (int minutes, ne datetime tuple) --------
+    # -------- TIME SLIDER (int minutes, radi na Streamlit Cloud) --------
     min_t, max_t = df["time"].min(), df["time"].max()
     total_minutes = max(1, int((max_t - min_t).total_seconds() / 60))
 
@@ -371,21 +393,26 @@ def main():
     )
     df = df[df["stage"].isin(selected_stages)]
 
-    # summary
     if df.empty:
         st.warning("No data in selected time/stage range.")
         return
 
+    # summary
     start = df["time"].min()
     end = df["time"].max() + timedelta(minutes=1)
     total_min = int((end - start).total_seconds() / 60)
     stage_counts = summarize_stages(df)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2 = st.columns(2)
     c1.metric("Sleep window", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
-    c2.metric("Duration", format_hm(total_min))
-    c3.metric("REM", format_hm(stage_counts.get("REM", 0)))
-    c4.metric("Deep", format_hm(stage_counts.get("DEEP", 0)))
+    c2.metric("Duration (filtered)", format_hm(total_min))
+
+    # ---- NOVO: trajanje svake faze (ovisno o filterima) ----
+    st.markdown("### Stage durations (filtered)")
+    cols = st.columns(len(selected_stages))
+    for col, stg in zip(cols, selected_stages):
+        mins = stage_counts.get(stg, 0)
+        col.metric(stg, format_hm(mins))
 
     st.markdown("### Hypnogram")
     hypno_fig = build_hypnogram_figure(df)
