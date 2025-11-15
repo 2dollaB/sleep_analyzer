@@ -337,13 +337,26 @@ def main():
     # time filter slider
     min_t, max_t = df["time"].min(), df["time"].max()
     st.sidebar.header("Time filter")
-    start_t, end_t = st.sidebar.slider(
-        "Visible time range",
-        min_value=min_t,
-        max_value=max_t,
-        value=(min_t, max_t),
-        format="HH:mm",
-    )
+    # --- TIME SLIDER FIX (avoid datetime tuples) ---
+min_t, max_t = df["time"].min(), df["time"].max()
+
+# pretvorba u minute od početka
+total_minutes = int((max_t - min_t).total_seconds() / 60)
+
+start_min, end_min = st.sidebar.slider(
+    "Visible time range (minutes from start)",
+    min_value=0,
+    max_value=total_minutes,
+    value=(0, total_minutes),
+)
+
+# pretvorba nazad u datetime
+start_t = min_t + timedelta(minutes=start_min)
+end_t = min_t + timedelta(minutes=end_min)
+
+# primijeni filter
+df = df[(df["time"] >= start_t) & (df["time"] <= end_t)]
+
     df = df[(df["time"] >= start_t) & (df["time"] <= end_t)]
 
     # stage filter
