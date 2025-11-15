@@ -18,6 +18,10 @@ def bcd_to_int(b: int) -> int:
 
 
 def parse_device_datetime(tokens: List[str], idx: int) -> datetime:
+    """
+    Decode a timestamp from tokens:
+    YY MM DD hh mm ss   (each 1 byte, hex printed)
+    """
     yy = int(tokens[idx], 16)
     mm = int(tokens[idx + 1], 16)
     dd = int(tokens[idx + 2], 16)
@@ -82,6 +86,7 @@ def parse_log_text(text: str):
 
         # 53 – sleep codes
         if cmd == "53":
+            # 53 00 00 YY MM DD hh mm ss LEN SD1 SD2 ...
             if len(tokens) < 11:
                 continue
             start_dt = parse_device_datetime(tokens, 3)
@@ -94,6 +99,7 @@ def parse_log_text(text: str):
 
         # 55 – HR
         elif cmd == "55":
+            # 55 id1 id2 YY MM DD hh mm ss HR
             if len(tokens) < 10:
                 continue
             dt = parse_device_datetime(tokens, 3)
@@ -108,7 +114,7 @@ def parse_log_text(text: str):
             hrv_val = int(tokens[9], 16)
             hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
 
-        # 52 – preskačemo za sada
+        # 52 – ignoriramo za sada
 
     return sleep_minutes, hr_samples, hrv_samples
 
@@ -221,7 +227,7 @@ def build_hypnogram_figure(df: pd.DataFrame):
         return None
 
     stage_order = ["AWAKE", "REM", "LIGHT", "DEEP"]
-    # blokovi kontinuiranih faza
+
     df = df.copy().sort_values("time")
     blocks = []
 
@@ -245,8 +251,10 @@ def build_hypnogram_figure(df: pd.DataFrame):
         )
 
     blocks_df = pd.DataFrame(blocks)
-    # filtriraj UNKNOWN da ne šara graf bezveze
     blocks_df = blocks_df[blocks_df["stage"] != "UNKNOWN"]
+
+    if blocks_df.empty:
+        return None
 
     fig = px.timeline(
         blocks_df,
@@ -256,16 +264,14 @@ def build_hypnogram_figure(df: pd.DataFrame):
         color="stage",
         category_orders={"stage": stage_order},
     )
-
-    fig.update_yaxes(autorange="reversed")  # DEEP dolje
+    fig.update_yaxes(autorange="reversed")
     fig.update_layout(
         xaxis_title="Time of night",
         yaxis_title="Stage",
-        showlegend=True,
         height=320,
         margin=dict(l=60, r=20, t=40, b=40),
+        legend_title="Stage",
     )
-
     return fig
 
 
@@ -317,7 +323,7 @@ def main():
 
     apply_stage_mapping(sleep_minutes)
 
-    # split into sessions i odabir sesije
+    # split into sessions and session picker
     sessions = split_sessions(sleep_minutes, gap_min=30)
     sessions = sorted(sessions, key=lambda s: s[-1].t)
 
@@ -326,40 +332,36 @@ def main():
         df_tmp = build_dataframe(sess)
         s = df_tmp["time"].min()
         e = df_tmp["time"].max()
-        session_labels.append(f"Session {i+1}  ({s.strftime('%Y-%m-%d %H:%M')} – {e.strftime('%H:%M')})")
+        session_labels.append(f"Session {i + 1}  ({s.strftime('%Y-%m-%d %H:%M')} – {e.strftime('%H:%M')})")
 
     st.sidebar.header("Session")
-    selected_idx = st.sidebar.selectbox("Choose sleep session", range(len(sessions)), format_func=lambda i: session_labels[i])
+    selected_idx = st.sidebar.selectbox(
+        "Choose sleep session",
+        range(len(sessions)),
+        format_func=lambda i: session_labels[i],
+    )
     session = sessions[selected_idx]
 
     df = build_dataframe(session)
 
-    # time filter slider
+    # -------- TIME SLIDER FIX (int minutes, ne datetime tuple) --------
     min_t, max_t = df["time"].min(), df["time"].max()
+    total_minutes = max(1, int((max_t - min_t).total_seconds() / 60))
+
     st.sidebar.header("Time filter")
-    # --- TIME SLIDER FIX (avoid datetime tuples) ---
-min_t, max_t = df["time"].min(), df["time"].max()
+    start_min, end_min = st.sidebar.slider(
+        "Visible time range (minutes from start)",
+        min_value=0,
+        max_value=total_minutes,
+        value=(0, total_minutes),
+    )
 
-# pretvorba u minute od početka
-total_minutes = int((max_t - min_t).total_seconds() / 60)
-
-start_min, end_min = st.sidebar.slider(
-    "Visible time range (minutes from start)",
-    min_value=0,
-    max_value=total_minutes,
-    value=(0, total_minutes),
-)
-
-# pretvorba nazad u datetime
-start_t = min_t + timedelta(minutes=start_min)
-end_t = min_t + timedelta(minutes=end_min)
-
-# primijeni filter
-df = df[(df["time"] >= start_t) & (df["time"] <= end_t)]
+    start_t = min_t + timedelta(minutes=start_min)
+    end_t = min_t + timedelta(minutes=end_min)
 
     df = df[(df["time"] >= start_t) & (df["time"] <= end_t)]
 
-    # stage filter
+    # -------- Stage filter --------
     st.sidebar.header("Stages")
     all_stages = ["AWAKE", "REM", "LIGHT", "DEEP"]
     selected_stages = st.sidebar.multiselect(
@@ -370,6 +372,10 @@ df = df[(df["time"] >= start_t) & (df["time"] <= end_t)]
     df = df[df["stage"].isin(selected_stages)]
 
     # summary
+    if df.empty:
+        st.warning("No data in selected time/stage range.")
+        return
+
     start = df["time"].min()
     end = df["time"].max() + timedelta(minutes=1)
     total_min = int((end - start).total_seconds() / 60)
