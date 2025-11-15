@@ -4,23 +4,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict
 
-import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 
-# ----------------- BCD / datetime helpers ----------------- #
+# =========================
+# Helpers (BCD / datetime)
+# =========================
 
 def bcd_to_int(b: int) -> int:
-    """Convert 1 byte from BCD (e.g., 0x25 -> 25)."""
     return (b >> 4) * 10 + (b & 0x0F)
 
 
 def parse_device_datetime(tokens: List[str], idx: int) -> datetime:
-    """
-    Decode a timestamp from tokens:
-    YY MM DD hh mm ss   (each 1 byte, hex printed)
-    """
     yy = int(tokens[idx], 16)
     mm = int(tokens[idx + 1], 16)
     dd = int(tokens[idx + 2], 16)
@@ -38,7 +35,9 @@ def parse_device_datetime(tokens: List[str], idx: int) -> datetime:
     return datetime(year, month, day, hour, minute, second)
 
 
-# ----------------- Data classes ----------------- #
+# =========================
+# Data classes
+# =========================
 
 @dataclass
 class SleepMinute:
@@ -58,10 +57,12 @@ class HrSample:
 @dataclass
 class HrvSample:
     t: datetime
-    hrv: int   # ← OVDJE: polje se sada zove hrv
+    hrv: int
 
 
-# ----------------- Parse log ----------------- #
+# =========================
+# Parsing log
+# =========================
 
 def parse_log_text(text: str):
     sleep_minutes: List[SleepMinute] = []
@@ -79,54 +80,44 @@ def parse_log_text(text: str):
 
         cmd = tokens[0]
 
-        # ---- 53 packets: sleep minute codes ----
+        # 53 – sleep codes
         if cmd == "53":
-            # Format from your logs:
-            # 53 00 00 YY MM DD hh mm ss LEN SD1 SD2 ...
             if len(tokens) < 11:
                 continue
-
             start_dt = parse_device_datetime(tokens, 3)
             length = int(tokens[9], 16)
             stage_bytes = tokens[10:10 + length]
-
             for i, sb in enumerate(stage_bytes):
                 code = int(sb, 16)
                 minute_dt = start_dt + timedelta(minutes=i)
-                sleep_minutes.append(
-                    SleepMinute(t=minute_dt, raw_code=code)
-                )
+                sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # ---- 55 packets: HR ----
+        # 55 – HR
         elif cmd == "55":
-            # 55 id1 id2 YY MM DD hh mm ss HR
             if len(tokens) < 10:
                 continue
             dt = parse_device_datetime(tokens, 3)
             hr = int(tokens[-1], 16)
             hr_samples.append(HrSample(t=dt, hr=hr))
 
-        # ---- 56 packets: HRV ----
+        # 56 – HRV
         elif cmd == "56":
             if len(tokens) < 11:
                 continue
             dt = parse_device_datetime(tokens, 3)
-            # heuristic metric: uzimamo tokens[9] kao HRV indeks
             hrv_val = int(tokens[9], 16)
             hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
 
-        # ---- 52 packets ignored for now ----
+        # 52 – preskačemo za sada
 
     return sleep_minutes, hr_samples, hrv_samples
 
 
-# ----------------- Attach nearest HR / HRV ----------------- #
+# =========================
+# Attach nearest HR / HRV
+# =========================
 
 def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min: float):
-    """
-    samples: lista objekata koji imaju atribut 't' i npr. 'hr' ili 'hrv'
-    attr: ime atributa u samples i ime polja koje želimo postaviti u SleepMinute
-    """
     if not samples or not minutes:
         return
 
@@ -152,7 +143,9 @@ def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min:
             setattr(m, attr, val)
 
 
-# ----------------- Split into sleep sessions ----------------- #
+# =========================
+# Split into sessions
+# =========================
 
 def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
     if not minutes:
@@ -174,7 +167,9 @@ def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
     return sessions
 
 
-# ----------------- Classification ----------------- #
+# =========================
+# Stage mapping
+# =========================
 
 RAW_CODE_TO_STAGE = {
     0: "UNKNOWN",
@@ -190,10 +185,12 @@ def apply_stage_mapping(minutes: List[SleepMinute]):
         m.stage = RAW_CODE_TO_STAGE.get(m.raw_code, "UNKNOWN")
 
 
-# ----------------- DataFrame builder ----------------- #
+# =========================
+# DataFrame helpers
+# =========================
 
 def build_dataframe(session: List[SleepMinute]) -> pd.DataFrame:
-    return pd.DataFrame(
+    df = pd.DataFrame(
         {
             "time": [m.t for m in session],
             "stage": [m.stage for m in session],
@@ -202,9 +199,8 @@ def build_dataframe(session: List[SleepMinute]) -> pd.DataFrame:
             "hrv": [m.hrv for m in session],
         }
     ).sort_values("time")
+    return df
 
-
-# ----------------- Stage duration summary ----------------- #
 
 def summarize_stages(df: pd.DataFrame) -> Dict[str, int]:
     return df["stage"].value_counts().to_dict()
@@ -216,19 +212,19 @@ def format_hm(minutes: int) -> str:
     return f"{h}h {m:02d}m"
 
 
-# ----------------- Hypnogram plot ----------------- #
+# =========================
+# Plotly hypnogram
+# =========================
 
-def plot_hypnogram(df: pd.DataFrame):
+def build_hypnogram_figure(df: pd.DataFrame):
     if df.empty:
         return None
 
     stage_order = ["AWAKE", "REM", "LIGHT", "DEEP"]
-    y_map = {s: i for i, s in enumerate(stage_order)}
-
+    # blokovi kontinuiranih faza
     df = df.copy().sort_values("time")
-    df["y"] = df["stage"].map(y_map)
-
     blocks = []
+
     if not df.empty:
         current_stage = df.iloc[0]["stage"]
         start_time = df.iloc[0]["time"]
@@ -238,104 +234,156 @@ def plot_hypnogram(df: pd.DataFrame):
             t = row["time"]
             stg = row["stage"]
             if stg != current_stage or (t - prev_time).total_seconds() > 90:
-                blocks.append((current_stage, start_time, prev_time + timedelta(minutes=1)))
+                blocks.append(
+                    {"stage": current_stage, "start": start_time, "end": prev_time + timedelta(minutes=1)}
+                )
                 current_stage = stg
                 start_time = t
             prev_time = t
-        blocks.append((current_stage, start_time, prev_time + timedelta(minutes=1)))
-
-    fig, ax = plt.subplots(figsize=(10, 3))
-
-    colors = {
-        "AWAKE": "#ffffff",
-        "REM": "#4ea5ff",
-        "LIGHT": "#7cc8ff",
-        "DEEP": "#274b8f",
-        "UNKNOWN": "#aaaaaa",
-    }
-
-    t0 = df["time"].min()
-
-    for stg, s, e in blocks:
-        if stg not in y_map:
-            continue
-        left = (s - t0).total_seconds() / 60.0
-        width = (e - s).total_seconds() / 60.0
-        ax.barh(
-            y=y_map[stg],
-            width=width,
-            left=left,
-            height=0.8,
-            color=colors.get(stg),
-            edgecolor="none",
+        blocks.append(
+            {"stage": current_stage, "start": start_time, "end": prev_time + timedelta(minutes=1)}
         )
 
-    ax.set_yticks(list(y_map.values()))
-    ax.set_yticklabels(stage_order)
-    ax.set_xlabel("Minutes from sleep start")
-    ax.invert_yaxis()
-    ax.grid(axis="x", linestyle="--", alpha=0.3)
+    blocks_df = pd.DataFrame(blocks)
+    # filtriraj UNKNOWN da ne šara graf bezveze
+    blocks_df = blocks_df[blocks_df["stage"] != "UNKNOWN"]
+
+    fig = px.timeline(
+        blocks_df,
+        x_start="start",
+        x_end="end",
+        y="stage",
+        color="stage",
+        category_orders={"stage": stage_order},
+    )
+
+    fig.update_yaxes(autorange="reversed")  # DEEP dolje
+    fig.update_layout(
+        xaxis_title="Time of night",
+        yaxis_title="Stage",
+        showlegend=True,
+        height=320,
+        margin=dict(l=60, r=20, t=40, b=40),
+    )
 
     return fig
 
 
-# ----------------- Streamlit UI ----------------- #
+def build_hr_figure(df: pd.DataFrame):
+    if df["hr"].dropna().empty:
+        return None
+
+    fig = px.line(
+        df,
+        x="time",
+        y="hr",
+        title="Heart rate during sleep",
+    )
+    fig.update_layout(
+        xaxis_title="Time of night",
+        yaxis_title="HR (bpm)",
+        height=300,
+        margin=dict(l=60, r=20, t=40, b=40),
+    )
+    return fig
+
+
+# =========================
+# Streamlit UI
+# =========================
 
 def main():
-    st.set_page_config(page_title="Sleep Viewer", layout="wide")
-    st.title("Sleep Viewer – Raw Log → Hypnogram")
+    st.set_page_config(page_title="Sleep Analyzer", layout="wide")
+    st.title("🛏️ Sleep Analyzer")
 
-    uploaded = st.file_uploader("Upload your sleep log (.txt)", type=["txt"])
+    st.write("Upload raw BLE log (.txt) from your band and explore your sleep in detail.")
+
+    uploaded = st.file_uploader("Upload sleep log (.txt)", type=["txt"])
 
     if not uploaded:
-        st.info("Upload your TXT log file.")
+        st.info("Waiting for file…")
         return
 
     text = uploaded.read().decode("utf-8", errors="ignore")
-
     sleep_minutes, hr_samples, hrv_samples = parse_log_text(text)
 
     if not sleep_minutes:
-        st.error("No 53 packets found (sleep data missing).")
+        st.error("No 53 packets (sleep data) found in this file.")
         return
 
-    # HR -> SleepMinute.hr
+    # attach HR / HRV
     attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=10)
-
-    # HRV -> SleepMinute.hrv
     attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=30)
 
     apply_stage_mapping(sleep_minutes)
 
+    # split into sessions i odabir sesije
     sessions = split_sessions(sleep_minutes, gap_min=30)
     sessions = sorted(sessions, key=lambda s: s[-1].t)
-    session = sessions[-1]
+
+    session_labels = []
+    for i, sess in enumerate(sessions):
+        df_tmp = build_dataframe(sess)
+        s = df_tmp["time"].min()
+        e = df_tmp["time"].max()
+        session_labels.append(f"Session {i+1}  ({s.strftime('%Y-%m-%d %H:%M')} – {e.strftime('%H:%M')})")
+
+    st.sidebar.header("Session")
+    selected_idx = st.sidebar.selectbox("Choose sleep session", range(len(sessions)), format_func=lambda i: session_labels[i])
+    session = sessions[selected_idx]
 
     df = build_dataframe(session)
 
+    # time filter slider
+    min_t, max_t = df["time"].min(), df["time"].max()
+    st.sidebar.header("Time filter")
+    start_t, end_t = st.sidebar.slider(
+        "Visible time range",
+        min_value=min_t,
+        max_value=max_t,
+        value=(min_t, max_t),
+        format="HH:mm",
+    )
+    df = df[(df["time"] >= start_t) & (df["time"] <= end_t)]
+
+    # stage filter
+    st.sidebar.header("Stages")
+    all_stages = ["AWAKE", "REM", "LIGHT", "DEEP"]
+    selected_stages = st.sidebar.multiselect(
+        "Show stages",
+        options=all_stages,
+        default=all_stages,
+    )
+    df = df[df["stage"].isin(selected_stages)]
+
+    # summary
     start = df["time"].min()
     end = df["time"].max() + timedelta(minutes=1)
     total_min = int((end - start).total_seconds() / 60)
     stage_counts = summarize_stages(df)
 
-    st.subheader("Sleep Summary")
-    c1, c2 = st.columns(2)
-    c1.metric("Sleep Window", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
-    c2.metric("Total Duration", format_hm(total_min))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sleep window", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
+    c2.metric("Duration", format_hm(total_min))
+    c3.metric("REM", format_hm(stage_counts.get("REM", 0)))
+    c4.metric("Deep", format_hm(stage_counts.get("DEEP", 0)))
 
-    st.write("**Stages:**")
-    for stage in ["AWAKE", "REM", "LIGHT", "DEEP", "UNKNOWN"]:
-        mins = stage_counts.get(stage, 0)
-        if mins > 0:
-            st.write(f"- {stage}: {format_hm(mins)} ({mins} min)")
+    st.markdown("### Hypnogram")
+    hypno_fig = build_hypnogram_figure(df)
+    if hypno_fig is not None:
+        st.plotly_chart(hypno_fig, use_container_width=True)
+    else:
+        st.info("Not enough data to draw hypnogram.")
 
-    st.subheader("Hypnogram")
-    fig = plot_hypnogram(df)
-    if fig:
-        st.pyplot(fig)
+    st.markdown("### Heart rate")
+    hr_fig = build_hr_figure(df)
+    if hr_fig is not None:
+        st.plotly_chart(hr_fig, use_container_width=True)
+    else:
+        st.info("No HR data available for this session.")
 
-    with st.expander("Debug Table"):
-        st.dataframe(df)
+    with st.expander("Debug table (per minute)"):
+        st.dataframe(df.reset_index(drop=True))
 
 
 if __name__ == "__main__":
