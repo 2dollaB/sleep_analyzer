@@ -402,4 +402,34 @@ def main():
     total_min = int((end - start).total_seconds() / 60)
     stage_counts = summarize_stages(df)
 
-    c1, c2 =
+    c1, c2 = st.columns(2)
+    c1.metric("Sleep window", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
+    c2.metric("Duration (filtered)", format_hm(total_min))
+
+    # trajanje svake faze za trenutačni filter
+    st.markdown("### Stage durations (filtered)")
+    cols = st.columns(len(selected_stages))
+    for col, stg in zip(cols, selected_stages):
+        mins = stage_counts.get(stg, 0)
+        col.metric(stg, format_hm(mins))
+
+    st.markdown("### Hypnogram")
+    hypno_fig = build_hypnogram_figure(df)
+    if hypno_fig is not None:
+        st.plotly_chart(hypno_fig, use_container_width=True)
+    else:
+        st.info("Not enough data to draw hypnogram.")
+
+    st.markdown("### Heart rate")
+    hr_fig = build_hr_figure(df)
+    if hr_fig is not None:
+        st.plotly_chart(hr_fig, use_container_width=True)
+    else:
+        st.info("No HR data available for this session.")
+
+    with st.expander("Debug table (per minute)"):
+        st.dataframe(df.reset_index(drop=True))
+
+
+if __name__ == "__main__":
+    main()
