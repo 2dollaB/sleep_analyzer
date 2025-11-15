@@ -14,13 +14,14 @@ import streamlit as st
 # =========================
 
 def bcd_to_int(b: int) -> int:
+    """Convert BCD-coded byte to int (0x24 -> 24, 0x11 -> 11)."""
     return (b >> 4) * 10 + (b & 0x0F)
 
 
 def parse_device_datetime(tokens: List[str], idx: int) -> datetime:
     """
-    Decode a timestamp from tokens that have:
-    YY MM DD hh mm ss   (each 1 byte, hex)
+    Decode timestamp from tokens[idx:idx+6] in BCD:
+    YY MM DD HH mm SS  (hex BCD)
     """
     yy = int(tokens[idx], 16)
     mm = int(tokens[idx + 1], 16)
@@ -65,7 +66,7 @@ class HrvSample:
 
 
 # =========================
-# Parsing log
+# Parsing log (53 / 55 / 56)
 # =========================
 
 def parse_log_text(text: str):
@@ -77,66 +78,61 @@ def parse_log_text(text: str):
         if "onCharacteristicChanged:" not in line:
             continue
 
-        _, payload_str = line.split("onCharacteristicChanged:", 1)
-        tokens = payload_str.strip().split()
+        payload = line.split("onCharacteristicChanged:", 1)[1].strip()
+        if not payload:
+            continue
+        tokens = payload.split()
         if not tokens:
             continue
 
-        cmd = tokens[0]
-
-        # 53 – sleep codes
-        if cmd == "53":
-            # 53 00 00 YY MM DD hh mm ss LEN SD1 SD2 ...
+        # 53 – sleep command
+        # Format: 53 idx 00 YY MM DD HH mm SS LEN S1..S120
+        if tokens[0] == "53":
             if len(tokens) < 11:
                 continue
-            start_dt = parse_device_datetime(tokens, 3)
+            try:
+                start_dt = parse_device_datetime(tokens, 3)
+            except Exception:
+                continue
+
             length = int(tokens[9], 16)
             stage_bytes = tokens[10:10 + length]
             for i, sb in enumerate(stage_bytes):
-                code = int(sb, 16)
+                try:
+                    code = int(sb, 16)
+                except ValueError:
+                    continue
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # 55 – HR (može biti više 55 paketa u jednoj liniji)
-        elif cmd == "55":
-            # format iz tvojih logova:
-            # 55 idx1 idx2 YY MM DD HH MM HR CRC
-            j = 0
-            while j < len(tokens):
-                if tokens[j] != "55":
-                    j += 1
-                    continue
-                # trebamo barem 10 tokena od ove pozicije
-                if j + 9 >= len(tokens):
-                    break
+        # 56 – HRV (format nije dokumentiran, ovo je samo placeholder)
+        if tokens[0] == "56":
+            if len(tokens) >= 10:
                 try:
-                    yy = int(tokens[j + 3], 16)
-                    mm = int(tokens[j + 4], 16)
-                    dd = int(tokens[j + 5], 16)
-                    hh = int(tokens[j + 6], 16)
-                    mi = int(tokens[j + 7], 16)
-                    year = 2000 + bcd_to_int(yy)
-                    month = bcd_to_int(mm)
-                    day = bcd_to_int(dd)
-                    hour = bcd_to_int(hh)
-                    minute = bcd_to_int(mi)
-                    dt = datetime(year, month, day, hour, minute, 0)
-                    hr_val = int(tokens[j + 8], 16)  # HR je pretposljednji bajt
-                    hr_samples.append(HrSample(t=dt, hr=hr_val))
+                    dt = parse_device_datetime(tokens, 3)
+                    # uzmi neki bajt kao HRV indeks (heuristika)
+                    hrv_val = int(tokens[9], 16)
+                    hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
                 except Exception:
                     pass
-                j += 10
 
-        # 56 – HRV
-        elif cmd == "56":
-            # 56 00 00 YY MM DD hh mm ss ... ; ovdje imamo punih 6 byte za vrijeme
-            if len(tokens) < 11:
+        # 55 – HR: može biti više paketa u jednoj liniji
+        # Format jednog paketa: 55 idx 00 YY MM DD HH mm SS HV
+        i = 0
+        n = len(tokens)
+        while i + 9 < n:
+            if tokens[i] != "55":
+                i += 1
                 continue
-            dt = parse_device_datetime(tokens, 3)
-            hrv_val = int(tokens[9], 16)  # heuristika – jedan od bajtova kao HRV index
-            hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
-
-        # 52 – steps (ignoriramo za sad)
+            try:
+                dt = parse_device_datetime(tokens, i + 3)
+                hr_val = int(tokens[i + 9], 16)
+                # sanity check
+                if 30 <= hr_val <= 220:
+                    hr_samples.append(HrSample(t=dt, hr=hr_val))
+            except Exception:
+                pass
+            i += 10  # sljedeći 55 paket
 
     return sleep_minutes, hr_samples, hrv_samples
 
@@ -172,7 +168,7 @@ def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min:
 
 
 # =========================
-# Split into sessions
+# Split into sessions (big gaps)
 # =========================
 
 def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
@@ -196,21 +192,23 @@ def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
 
 
 # =========================
-# Stage mapping
+# Stage mapping (from firmware doc)
+# 01 -> deep, 02 -> light, 03 -> REM, else -> awake
 # =========================
 
-RAW_CODE_TO_STAGE = {
-    0: "UNKNOWN",
-    1: "AWAKE",
-    2: "LIGHT",
-    3: "DEEP",
-    4: "REM",
-}
+def code_to_stage(code: int) -> str:
+    if code == 0x01:
+        return "DEEP"
+    if code == 0x02:
+        return "LIGHT"
+    if code == 0x03:
+        return "REM"
+    return "AWAKE"
 
 
 def apply_stage_mapping(minutes: List[SleepMinute]):
     for m in minutes:
-        m.stage = RAW_CODE_TO_STAGE.get(m.raw_code, "UNKNOWN")
+        m.stage = code_to_stage(m.raw_code)
 
 
 # =========================
@@ -253,24 +251,25 @@ def build_hypnogram_figure(df: pd.DataFrame):
     df = df.copy().sort_values("time")
     blocks = []
 
-    if not df.empty:
-        current_stage = df.iloc[0]["stage"]
-        start_time = df.iloc[0]["time"]
-        prev_time = start_time
+    current_stage = df.iloc[0]["stage"]
+    start_time = df.iloc[0]["time"]
+    prev_time = start_time
 
-        for _, row in df.iloc[1:].iterrows():
-            t = row["time"]
-            stg = row["stage"]
-            if stg != current_stage or (t - prev_time).total_seconds() > 90:
-                blocks.append(
-                    {"stage": current_stage, "start": start_time, "end": prev_time + timedelta(minutes=1)}
-                )
-                current_stage = stg
-                start_time = t
-            prev_time = t
-        blocks.append(
-            {"stage": current_stage, "start": start_time, "end": prev_time + timedelta(minutes=1)}
-        )
+    for _, row in df.iloc[1:].iterrows():
+        t = row["time"]
+        stg = row["stage"]
+        # prekid ako se promijeni faza ili ako je rupa > 90s
+        if stg != current_stage or (t - prev_time).total_seconds() > 90:
+            blocks.append(
+                {"stage": current_stage, "start": start_time, "end": prev_time + timedelta(minutes=1)}
+            )
+            current_stage = stg
+            start_time = t
+        prev_time = t
+
+    blocks.append(
+        {"stage": current_stage, "start": start_time, "end": prev_time + timedelta(minutes=1)}
+    )
 
     blocks_df = pd.DataFrame(blocks)
     blocks_df = blocks_df[blocks_df["stage"] != "UNKNOWN"]
@@ -324,7 +323,7 @@ def main():
     st.set_page_config(page_title="Sleep Analyzer", layout="wide")
     st.title("🛏️ Sleep Analyzer")
 
-    st.write("Upload raw BLE log (.txt) from your band and explore your sleep in detail.")
+    st.write("Upload raw BLE log (.txt) from your Rolla Band and explore your sleep in detail.")
 
     uploaded = st.file_uploader("Upload sleep log (.txt)", type=["txt"])
 
@@ -366,7 +365,7 @@ def main():
 
     df = build_dataframe(session)
 
-    # -------- TIME SLIDER (int minutes, radi na Streamlit Cloud) --------
+    # -------- TIME SLIDER (int minutes, radi i na Streamlit Cloud) --------
     min_t, max_t = df["time"].min(), df["time"].max()
     total_minutes = max(1, int((max_t - min_t).total_seconds() / 60))
 
@@ -403,34 +402,4 @@ def main():
     total_min = int((end - start).total_seconds() / 60)
     stage_counts = summarize_stages(df)
 
-    c1, c2 = st.columns(2)
-    c1.metric("Sleep window", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
-    c2.metric("Duration (filtered)", format_hm(total_min))
-
-    # ---- NOVO: trajanje svake faze (ovisno o filterima) ----
-    st.markdown("### Stage durations (filtered)")
-    cols = st.columns(len(selected_stages))
-    for col, stg in zip(cols, selected_stages):
-        mins = stage_counts.get(stg, 0)
-        col.metric(stg, format_hm(mins))
-
-    st.markdown("### Hypnogram")
-    hypno_fig = build_hypnogram_figure(df)
-    if hypno_fig is not None:
-        st.plotly_chart(hypno_fig, use_container_width=True)
-    else:
-        st.info("Not enough data to draw hypnogram.")
-
-    st.markdown("### Heart rate")
-    hr_fig = build_hr_figure(df)
-    if hr_fig is not None:
-        st.plotly_chart(hr_fig, use_container_width=True)
-    else:
-        st.info("No HR data available for this session.")
-
-    with st.expander("Debug table (per minute)"):
-        st.dataframe(df.reset_index(drop=True))
-
-
-if __name__ == "__main__":
-    main()
+    c1, c2 =
