@@ -505,7 +505,7 @@ def main():
     # Koju kolonu koristimo kao "stage"?
     stage_col = "device_stage" if stage_source.startswith("Device") else "custom_stage"
     df_view["stage_used"] = df_view[stage_col]
-
+    
     # -------- Stage filter --------
     st.sidebar.header("Stages")
     all_stages = ["AWAKE", "REM", "LIGHT", "DEEP"]
@@ -532,7 +532,7 @@ def main():
     end = df_view["time"].max() + timedelta(minutes=1)
     total_min = int((end - start).total_seconds() / 60)
 
-    df_stage = df_view.rename(columns={"stage_used": "stage"})
+    df_stage = df_view[["time", "stage_used"]].rename(columns={"stage_used": "stage"})
     stage_counts = summarize_stages(df_stage)
 
     c1, c2 = st.columns(2)
