@@ -48,7 +48,7 @@ def parse_device_datetime(tokens: List[str], idx: int) -> datetime:
 class SleepMinute:
     t: datetime
     raw_code: int
-    stage: str = "UNKNOWN"
+    stage: str = "UNKNOWN"   # ovo će biti "device" stage
     hr: Optional[int] = None
     hrv: Optional[int] = None
 
@@ -105,18 +105,17 @@ def parse_log_text(text: str):
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # 56 – HRV (format nije dokumentiran, ovo je samo placeholder)
+        # 56 – HRV (format nije skroz jasan, koristimo ga kao "index")
         if tokens[0] == "56":
             if len(tokens) >= 10:
                 try:
                     dt = parse_device_datetime(tokens, 3)
-                    # uzmi neki bajt kao HRV indeks (heuristika)
                     hrv_val = int(tokens[9], 16)
                     hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
                 except Exception:
                     pass
 
-        # 55 – HR: može biti više paketa u jednoj liniji
+        # 55 – HR: više paketa u jednoj liniji
         # Format jednog paketa: 55 idx 00 YY MM DD HH mm SS HV
         i = 0
         n = len(tokens)
@@ -127,7 +126,6 @@ def parse_log_text(text: str):
             try:
                 dt = parse_device_datetime(tokens, i + 3)
                 hr_val = int(tokens[i + 9], 16)
-                # sanity check
                 if 30 <= hr_val <= 220:
                     hr_samples.append(HrSample(t=dt, hr=hr_val))
             except Exception:
@@ -138,7 +136,7 @@ def parse_log_text(text: str):
 
 
 # =========================
-# Attach nearest HR / HRV
+# Attach nearest HR / HRV to minute grid
 # =========================
 
 def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min: float):
@@ -168,7 +166,7 @@ def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min:
 
 
 # =========================
-# Split into sessions (big gaps)
+# Split into sessions (prekid veći od X minuta = nova sesija)
 # =========================
 
 def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
@@ -192,8 +190,8 @@ def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
 
 
 # =========================
-# Stage mapping (from firmware doc)
-# 01 -> deep, 02 -> light, 03 -> REM, else -> awake
+# Device stage mapping (53) – SAMO za usporedbu
+# 01 -> deep, 02 -> light, 03 -> REM, ostalo -> awake
 # =========================
 
 def code_to_stage(code: int) -> str:
@@ -206,7 +204,7 @@ def code_to_stage(code: int) -> str:
     return "AWAKE"
 
 
-def apply_stage_mapping(minutes: List[SleepMinute]):
+def apply_device_stage(minutes: List[SleepMinute]):
     for m in minutes:
         m.stage = code_to_stage(m.raw_code)
 
@@ -219,7 +217,7 @@ def build_dataframe(session: List[SleepMinute]) -> pd.DataFrame:
     df = pd.DataFrame(
         {
             "time": [m.t for m in session],
-            "stage": [m.stage for m in session],
+            "stage": [m.stage for m in session],  # ovo je "device" stage
             "raw_code": [m.raw_code for m in session],
             "hr": [m.hr for m in session],
             "hrv": [m.hrv for m in session],
@@ -243,6 +241,7 @@ def format_hm(minutes: int) -> str:
 # =========================
 
 def build_hypnogram_figure(df: pd.DataFrame):
+    """Očekuje df s kolonom 'stage' = AWAKE/REM/LIGHT/DEEP i 'time'."""
     if df.empty:
         return None
 
@@ -258,7 +257,6 @@ def build_hypnogram_figure(df: pd.DataFrame):
     for _, row in df.iloc[1:].iterrows():
         t = row["time"]
         stg = row["stage"]
-        # prekid ako se promijeni faza ili ako je rupa > 90s
         if stg != current_stage or (t - prev_time).total_seconds() > 90:
             blocks.append(
                 {"stage": current_stage, "start": start_time, "end": prev_time + timedelta(minutes=1)}
@@ -272,7 +270,7 @@ def build_hypnogram_figure(df: pd.DataFrame):
     )
 
     blocks_df = pd.DataFrame(blocks)
-    blocks_df = blocks_df[blocks_df["stage"] != "UNKNOWN"]
+    blocks_df = blocks_df[blocks_df["stage"].isin(stage_order)]
 
     if blocks_df.empty:
         return None
@@ -296,12 +294,30 @@ def build_hypnogram_figure(df: pd.DataFrame):
     return fig
 
 
-def build_hr_figure(df: pd.DataFrame):
-    if df["hr"].dropna().empty:
+# =========================
+# HR graf direktno iz HR sampleova
+# =========================
+
+def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=None):
+    """Crta HR graf direktno iz liste HrSample, ne iz df['hr']."""
+    if not samples:
         return None
 
+    rows = []
+    for s in samples:
+        if start_t and s.t < start_t:
+            continue
+        if end_t and s.t > end_t:
+            continue
+        rows.append({"time": s.t, "hr": s.hr})
+
+    if not rows:
+        return None
+
+    df_hr = pd.DataFrame(rows).sort_values("time")
+
     fig = px.line(
-        df,
+        df_hr,
         x="time",
         y="hr",
         title="Heart rate during sleep",
@@ -316,14 +332,104 @@ def build_hr_figure(df: pd.DataFrame):
 
 
 # =========================
+# NAŠ CUSTOM ALGORITAM ZA FAZE
+# =========================
+
+def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
+    """
+    Na osnovu HR + HRV + pozicije u noći:
+      - DEEP: najniži HR, visoki HRV
+      - REM: viši HR, niski HRV, kasniji dio noći
+      - LIGHT: sve ostalo unutar sna
+      - AWAKE: jako visoki HR, rubovi noći
+    53 koristimo samo za okvir (start/end), ne za faze.
+    """
+    df = df.copy()
+
+    # ako baš nemamo HR, fallback na device stage
+    if df["hr"].notna().sum() < 5:
+        return df["stage"].fillna("LIGHT")
+
+    # smoothing HR i HRV
+    hr_s = df["hr"].astype("float").interpolate(limit_direction="both")
+    hr_s = hr_s.rolling(5, min_periods=1, center=True).mean()
+
+    hrv_s = df["hrv"].astype("float")
+    if hrv_s.notna().sum() > 5:
+        hrv_s = hrv_s.interpolate(limit_direction="both")
+        hrv_s = hrv_s.rolling(5, min_periods=1, center=True).mean()
+    else:
+        hrv_s = None
+
+    # pragovi
+    hr_low = hr_s.quantile(0.30)
+    hr_high = hr_s.quantile(0.70)
+
+    if hrv_s is not None:
+        hrv_low = hrv_s.quantile(0.30)
+        hrv_high = hrv_s.quantile(0.70)
+    else:
+        hrv_low = hrv_high = None
+
+    t_start = df["time"].min()
+    t_end = df["time"].max()
+    total_sec = max(1.0, (t_end - t_start).total_seconds())
+
+    stages = []
+
+    for idx, row in df.iterrows():
+        t = row["time"]
+        hr_val = hr_s.loc[idx]
+        hrv_val = hrv_s.loc[idx] if hrv_s is not None else None
+        frac = (t - t_start).total_seconds() / total_sec  # 0.0 = početak, 1.0 = kraj
+
+        stage = "LIGHT"
+
+        # Deep: niski HR, visoki HRV, obično prva polovica noći (ali ne forsiramo previše)
+        if hr_val <= hr_low:
+            if hrv_high is not None and hrv_val is not None and hrv_val >= hrv_high:
+                stage = "DEEP"
+            else:
+                # i bez HRV, ako je HR jako nizak, često je deep
+                stage = "DEEP"
+
+        # REM: viši HR, niži HRV, kasniji dio noći
+        if hr_val >= hr_high and frac > 0.25:
+            if hrv_low is not None and hrv_val is not None and hrv_val <= hrv_low:
+                stage = "REM"
+            else:
+                # i bez HRV, kasni viši HR često je REM
+                stage = "REM"
+
+        # Awake override: jako visoki HR ili rubovi noći
+        if hr_val >= hr_high + 8:
+            stage = "AWAKE"
+        if frac < 0.03 or frac > 0.97:
+            if hr_val >= hr_high:
+                stage = "AWAKE"
+
+        stages.append(stage)
+
+    s = pd.Series(stages, index=df.index)
+
+    # mali smoothing – makni izolirane single minute
+    s_smoothed = s.copy()
+    for i in range(1, len(s) - 1):
+        if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
+            s_smoothed.iloc[i] = s.iloc[i - 1]
+
+    return s_smoothed
+
+
+# =========================
 # Streamlit UI
 # =========================
 
 def main():
     st.set_page_config(page_title="Sleep Analyzer", layout="wide")
-    st.title("🛏️ Sleep Analyzer")
+    st.title("🛏️ Sleep Analyzer – Device vs Custom")
 
-    st.write("Upload raw BLE log (.txt) from your Rolla Band and explore your sleep in detail.")
+    st.write("Upload raw BLE log (.txt) from your band and compare device staging (cmd 53) vs our custom HR+HRV algorithm.")
 
     uploaded = st.file_uploader("Upload sleep log (.txt)", type=["txt"])
 
@@ -338,13 +444,14 @@ def main():
         st.error("No 53 packets (sleep data) found in this file.")
         return
 
-    # attach HR / HRV
+    # zalijepi HR / HRV na minute
     attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=10)
     attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=30)
 
-    apply_stage_mapping(sleep_minutes)
+    # device staging (samo za usporedbu)
+    apply_device_stage(sleep_minutes)
 
-    # split into sessions and session picker
+    # split into sessions (na temelju 53, ali faze ćemo raditi custom)
     sessions = split_sessions(sleep_minutes, gap_min=30)
     sessions = sorted(sessions, key=lambda s: s[-1].t)
 
@@ -363,10 +470,23 @@ def main():
     )
     session = sessions[selected_idx]
 
-    df = build_dataframe(session)
+    df_full = build_dataframe(session)
+    df_full["device_stage"] = df_full["stage"]
+    df_full["custom_stage"] = compute_custom_stage(df_full)
 
-    # -------- TIME SLIDER (int minutes, radi i na Streamlit Cloud) --------
-    min_t, max_t = df["time"].min(), df["time"].max()
+    # Stage source toggle
+    st.sidebar.header("Stage source")
+    stage_source = st.sidebar.radio(
+        "Use stages from",
+        ["Device (cmd 53)", "Custom (HR+HRV)"],
+        index=1,  # default na naš algoritam :)
+    )
+
+    # Info o broju HR/HRV uzoraka
+    st.sidebar.caption(f"HR samples: {len(hr_samples)} | HRV samples: {len(hrv_samples)}")
+
+    # -------- TIME SLIDER (minute, radi i na Streamlit Cloud) --------
+    min_t, max_t = df_full["time"].min(), df_full["time"].max()
     total_minutes = max(1, int((max_t - min_t).total_seconds() / 60))
 
     st.sidebar.header("Time filter")
@@ -380,7 +500,11 @@ def main():
     start_t = min_t + timedelta(minutes=start_min)
     end_t = min_t + timedelta(minutes=end_min)
 
-    df = df[(df["time"] >= start_t) & (df["time"] <= end_t)]
+    df_view = df_full[(df_full["time"] >= start_t) & (df_full["time"] <= end_t)].copy()
+
+    # Koju kolonu koristimo kao "stage"?
+    stage_col = "device_stage" if stage_source.startswith("Device") else "custom_stage"
+    df_view["stage_used"] = df_view[stage_col]
 
     # -------- Stage filter --------
     st.sidebar.header("Stages")
@@ -390,45 +514,53 @@ def main():
         options=all_stages,
         default=all_stages,
     )
-    df = df[df["stage"].isin(selected_stages)]
+    df_view = df_view[df_view["stage_used"].isin(selected_stages)]
 
-    if df.empty:
+    if df_view.empty:
         st.warning("No data in selected time/stage range.")
+        # ali svejedno pokušaj prikazati HR graf za taj vremenski interval
+        st.markdown("### Heart rate")
+        hr_fig = build_hr_figure_from_samples(hr_samples, start_t=start_t, end_t=end_t)
+        if hr_fig is not None:
+            st.plotly_chart(hr_fig, use_container_width=True)
+        else:
+            st.info("No HR data available for this session.")
         return
 
     # summary
-    start = df["time"].min()
-    end = df["time"].max() + timedelta(minutes=1)
+    start = df_view["time"].min()
+    end = df_view["time"].max() + timedelta(minutes=1)
     total_min = int((end - start).total_seconds() / 60)
-    stage_counts = summarize_stages(df)
+
+    df_stage = df_view.rename(columns={"stage_used": "stage"})
+    stage_counts = summarize_stages(df_stage)
 
     c1, c2 = st.columns(2)
-    c1.metric("Sleep window", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
-    c2.metric("Duration (filtered)", format_hm(total_min))
+    c1.metric("Sleep window (visible)", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
+    c2.metric("Duration (visible)", format_hm(total_min))
 
-    # trajanje svake faze za trenutačni filter
-    st.markdown("### Stage durations (filtered)")
+    st.markdown(f"### Stage durations (filtered) – source: **{stage_source}**")
     cols = st.columns(len(selected_stages))
     for col, stg in zip(cols, selected_stages):
         mins = stage_counts.get(stg, 0)
         col.metric(stg, format_hm(mins))
 
     st.markdown("### Hypnogram")
-    hypno_fig = build_hypnogram_figure(df)
+    hypno_fig = build_hypnogram_figure(df_stage)
     if hypno_fig is not None:
         st.plotly_chart(hypno_fig, use_container_width=True)
     else:
         st.info("Not enough data to draw hypnogram.")
 
     st.markdown("### Heart rate")
-    hr_fig = build_hr_figure(df)
+    hr_fig = build_hr_figure_from_samples(hr_samples, start_t=start_t, end_t=end_t)
     if hr_fig is not None:
         st.plotly_chart(hr_fig, use_container_width=True)
     else:
         st.info("No HR data available for this session.")
 
     with st.expander("Debug table (per minute)"):
-        st.dataframe(df.reset_index(drop=True))
+        st.dataframe(df_view.reset_index(drop=True))
 
 
 if __name__ == "__main__":
