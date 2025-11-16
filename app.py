@@ -361,11 +361,14 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     """
-    v2.0:
-      - koristi HR (smoothed) + HRV ako postoji + steps
-      - REM kasnije u noći, DEEP ranije
-      - limitira max DEEP ~30% ukupnog sna
-      - ako je REM prenizak (<15%), dio kasnog LIGHT sna -> REM
+    v3:
+      - nema globalnog forsiranja postotaka (nema max DEEP / min REM)
+      - samo lokalni signal:
+          * HR (razina)
+          * dHR (promjena HR)
+          * HRV (ako postoji)
+          * pozicija u noći (frac)
+          * steps za budnost
     """
     df = df.copy()
 
@@ -385,25 +388,25 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     else:
         hrv_s = None
 
-    # steps (tretiramo NaN kao 0)
+    # steps (NaN -> 0)
     steps_s = df["steps"].fillna(0)
 
-    # HR derivative (za REM / Awake)
+    # HR derivative (REM i Awake imaju veće oscilacije)
     hr_diff = hr_s.diff().abs().rolling(3, min_periods=1).mean()
 
-    # pragovi
-    hr_low = hr_s.quantile(0.30)
-    hr_high = hr_s.quantile(0.70)
+    # pragovi (malo konzervativniji)
+    hr_low = hr_s.quantile(0.25)
+    hr_high = hr_s.quantile(0.75)
     hr_very_high = hr_s.quantile(0.90)
 
     if hrv_s is not None:
-        hrv_low = hrv_s.quantile(0.30)
-        hrv_high = hrv_s.quantile(0.70)
+        hrv_low = hrv_s.quantile(0.25)
+        hrv_high = hrv_s.quantile(0.75)
     else:
         hrv_low = hrv_high = None
 
-    diff_low = hr_diff.quantile(0.30)
-    diff_high = hr_diff.quantile(0.70)
+    diff_low = hr_diff.quantile(0.25)
+    diff_high = hr_diff.quantile(0.75)
 
     t_start = df["time"].min()
     t_end = df["time"].max()
@@ -417,37 +420,37 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
         diff_val = hr_diff.loc[idx]
         hrv_val = hrv_s.loc[idx] if hrv_s is not None else None
         steps_val = steps_s.loc[idx]
-        frac = (t - t_start).total_seconds() / total_sec  # 0.0 = početak, 1.0 = kraj
+        frac = (t - t_start).total_seconds() / total_sec  # 0.0 početak, 1.0 kraj
 
-        # default pretpostavka: sleep
+        # default je sleep (LIGHT) – prvo provjerimo budnost
         stage = "LIGHT"
 
-        # --- Awake logika ---
-        # koraci ili jako visoki HR + velika promjena HR
+        # --- Awake ---
         if steps_val and steps_val > 0:
             stage = "AWAKE"
-        elif hr_val >= hr_very_high and diff_val >= diff_high and (frac < 0.1 or frac > 0.9):
-            stage = "AWAKE"
-
-        if stage == "AWAKE":
             stages.append(stage)
             continue
 
-        # --- Deep / REM score based approach ---
+        if hr_val >= hr_very_high and diff_val >= diff_high and (frac < 0.1 or frac > 0.9):
+            stage = "AWAKE"
+            stages.append(stage)
+            continue
+
+        # --- Scoring za DEEP i REM ---
         deep_score = 0
         rem_score = 0
 
-        # Deep: niski HR, stabilan HR, viši HRV, ranije u noći
+        # Deep: nizak HR, stabilan HR, (po mogućnosti) visok HRV, raniji dio noći
         if hr_val <= hr_low:
             deep_score += 2
         if diff_val <= diff_low:
             deep_score += 1
         if hrv_high is not None and hrv_val is not None and hrv_val >= hrv_high:
             deep_score += 2
-        if frac < 0.5:
+        if frac < 0.4:
             deep_score += 1
 
-        # REM: viši HR, oscilacije, niži HRV, kasnije u noći
+        # REM: viši HR, veća varijacija, niži HRV, kasnije u noći
         if hr_val >= hr_high:
             rem_score += 2
         if diff_val >= diff_high:
@@ -457,9 +460,10 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
         if frac > 0.3:
             rem_score += 1
 
-        if deep_score >= rem_score and deep_score >= 2:
+        # odlučivanje – treba veći score i REM/DEEP da bude barem "jači" od LIGHT-a
+        if deep_score >= 3 and deep_score > rem_score:
             stage = "DEEP"
-        elif rem_score > deep_score and rem_score >= 2:
+        elif rem_score >= 3 and rem_score > deep_score:
             stage = "REM"
         else:
             stage = "LIGHT"
@@ -468,46 +472,14 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
 
     s = pd.Series(stages, index=df.index)
 
-    # smoothing: ukloni izolirane single-minute promjene
+    # Smoothing: makni izolirane single-minute skokove
     s_smoothed = s.copy()
     for i in range(1, len(s) - 1):
         if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
             s_smoothed.iloc[i] = s.iloc[i - 1]
 
-    # ---- Distribucijska korekcija (max deep 30%, min REM 15%) ----
-    sleep_mask = s_smoothed != "AWAKE"
-    sleep_minutes = sleep_mask.sum()
-    if sleep_minutes > 0:
-        # limit DEEP
-        deep_mask = (s_smoothed == "DEEP")
-        deep_minutes = deep_mask.sum()
-        max_deep = int(0.30 * sleep_minutes)
-        if deep_minutes > max_deep:
-            # uzmi DEEP minute s najvišim HR (najmanje deep) i prebaci u LIGHT
-            df_deep = df.loc[deep_mask].copy()
-            hr_s_local = hr_s.loc[deep_mask]
-            df_deep["hr_s"] = hr_s_local
-            df_deep = df_deep.sort_values("hr_s", ascending=False)
-            to_light_idx = df_deep.index[: (deep_minutes - max_deep)]
-            s_smoothed.loc[to_light_idx] = "LIGHT"
-
-        # ensure min REM ~15% ako imamo dovoljno sna
-        rem_mask = (s_smoothed == "REM")
-        rem_minutes = rem_mask.sum()
-        min_rem = int(0.15 * sleep_minutes)
-        if rem_minutes < min_rem:
-            # uzmi LIGHT minute kasno u noći s višim HR i prebaci u REM
-            light_mask = (s_smoothed == "LIGHT")
-            df_light = df.loc[light_mask].copy()
-            frac_list = ((df_light["time"] - t_start).dt.total_seconds() / total_sec)
-            df_light["frac"] = frac_list
-            df_light["hr_s"] = hr_s.loc[light_mask]
-            df_light = df_light.sort_values(["frac", "hr_s"], ascending=[False, False])
-            need = min_rem - rem_minutes
-            to_rem_idx = df_light.index[:need]
-            s_smoothed.loc[to_rem_idx] = "REM"
-
     return s_smoothed
+
 
 
 # =========================
