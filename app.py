@@ -12,6 +12,50 @@ import urllib.parse
 
 
 # =========================
+# Privacy & Terms
+# =========================
+
+def render_privacy_policy():
+    st.title("Privacy Policy")
+    st.write("""
+    ### Sleep Analyzer – Privacy Policy
+
+    This project is a development / testing tool used for personal analysis of sleep data.
+    We do not store, share or process any user data outside of this application.
+    Your Oura API access token is used only to fetch data directly to your browser session
+    and is never saved on any external server.
+
+    **What data is processed?**
+    - Sleep stages
+    - Heart rate data
+    - HRV values
+
+    **Where is the data stored?**  
+    - Only temporarily inside your browser session.
+    - No data is sent to third-party servers.
+
+    **Contact**: minarik.jan@rolla.app  
+    """)
+
+
+def render_terms_of_service():
+    st.title("Terms of Service")
+    st.write("""
+    ### Sleep Analyzer – Terms of Service
+
+    This tool is intended solely for personal experimentation and development.
+    By using this application, you agree that:
+
+    - You are providing your own Oura account access voluntarily
+    - The authors of this tool are not responsible for incorrect or incomplete data
+    - The tool is not a medical device
+    - All data remains your property and is not stored outside your usage session
+
+    For any questions, contact: minarik.jan@rolla.app
+    """)
+
+
+# =========================
 # Helpers (BCD / datetime)
 # =========================
 
@@ -115,7 +159,7 @@ def parse_log_text(text: str):
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # 56 – HRV (format nije skroz jasan, koristimo ga kao "index")
+        # 56 – HRV (heuristički)
         if tokens[0] == "56":
             if len(tokens) >= 10:
                 try:
@@ -126,7 +170,6 @@ def parse_log_text(text: str):
                     pass
 
         # 55 – HR: više paketa u jednoj liniji
-        # Format jednog paketa: 55 idx 00 YY MM DD HH mm SS HV
         i = 0
         n = len(tokens)
         while i + 9 < n:
@@ -140,9 +183,9 @@ def parse_log_text(text: str):
                     hr_samples.append(HrSample(t=dt, hr=hr_val))
             except Exception:
                 pass
-            i += 10  # sljedeći 55 paket
+            i += 10
 
-        # 52 – steps: pretpostavimo isti pattern kao 55 (heuristika)
+        # 52 – steps (heuristika)
         j = 0
         n2 = len(tokens)
         while j + 9 < n2:
@@ -191,7 +234,7 @@ def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min:
 
 
 # =========================
-# Split into sessions (prekid veći od X minuta = nova sesija)
+# Split into sessions (prekid > X min = nova sesija)
 # =========================
 
 def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
@@ -215,8 +258,7 @@ def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
 
 
 # =========================
-# Device stage mapping (53) – SAMO za usporedbu
-# 01 -> deep, 02 -> light, 03 -> REM, ostalo -> awake
+# Device stage mapping (53) – samo za usporedbu
 # =========================
 
 def code_to_stage(code: int) -> str:
@@ -242,7 +284,7 @@ def build_dataframe(session: List[SleepMinute]) -> pd.DataFrame:
     df = pd.DataFrame(
         {
             "time": [m.t for m in session],
-            "stage": [m.stage for m in session],  # "device" stage
+            "stage": [m.stage for m in session],
             "raw_code": [m.raw_code for m in session],
             "hr": [m.hr for m in session],
             "hrv": [m.hrv for m in session],
@@ -267,7 +309,6 @@ def format_hm(minutes: int) -> str:
 # =========================
 
 def build_hypnogram_figure(df: pd.DataFrame):
-    """Očekuje df s kolonom 'stage' = AWAKE/REM/LIGHT/DEEP i 'time'."""
     if df.empty:
         return None
 
@@ -275,7 +316,6 @@ def build_hypnogram_figure(df: pd.DataFrame):
 
     df = df.copy().sort_values("time")
     blocks = []
-
     current_stage = df.iloc[0]["stage"]
     start_time = df.iloc[0]["time"]
     prev_time = start_time
@@ -297,7 +337,6 @@ def build_hypnogram_figure(df: pd.DataFrame):
 
     blocks_df = pd.DataFrame(blocks)
     blocks_df = blocks_df[blocks_df["stage"].isin(stage_order)]
-
     if blocks_df.empty:
         return None
 
@@ -321,11 +360,10 @@ def build_hypnogram_figure(df: pd.DataFrame):
 
 
 # =========================
-# HR graf direktno iz HR sampleova
+# HR graf iz HR sampleova
 # =========================
 
 def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=None):
-    """Crta HR graf direktno iz liste HrSample, ne iz df['hr']."""
     if not samples:
         return None
 
@@ -342,12 +380,7 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
     df_hr = pd.DataFrame(rows).sort_values("time")
 
-    fig = px.line(
-        df_hr,
-        x="time",
-        y="hr",
-        title="Heart rate during sleep",
-    )
+    fig = px.line(df_hr, x="time", y="hr")
     fig.update_layout(
         xaxis_title="Time of night",
         yaxis_title="HR (bpm)",
@@ -358,31 +391,18 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
 
 # =========================
-# CUSTOM ALGORITAM v3 (Rolla – HR+HRV+steps)
+# Custom algoritam v3
 # =========================
 
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
-    """
-    v3:
-      - nema globalnog forsiranja postotaka
-      - lokalni signal:
-          * HR (razina)
-          * dHR (promjena HR)
-          * HRV (ako postoji)
-          * pozicija u noći (frac)
-          * steps za budnost
-    """
     df = df.copy()
 
-    # fallback: ako nemamo HR, koristi device stage
     if df["hr"].notna().sum() < 5:
         return df["stage"].fillna("LIGHT")
 
-    # HR smoothing
     hr_s = df["hr"].astype("float").interpolate(limit_direction="both")
     hr_s = hr_s.rolling(5, min_periods=1, center=True).mean()
 
-    # HRV smoothing (ako ima)
     hrv_s = df["hrv"].astype("float")
     if hrv_s.notna().sum() > 5:
         hrv_s = hrv_s.interpolate(limit_direction="both")
@@ -390,13 +410,9 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     else:
         hrv_s = None
 
-    # steps (NaN -> 0)
     steps_s = df["steps"].fillna(0)
-
-    # HR derivative (REM i Awake imaju veće oscilacije)
     hr_diff = hr_s.diff().abs().rolling(3, min_periods=1).mean()
 
-    # pragovi
     hr_low = hr_s.quantile(0.25)
     hr_high = hr_s.quantile(0.75)
     hr_very_high = hr_s.quantile(0.90)
@@ -422,11 +438,11 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
         diff_val = hr_diff.loc[idx]
         hrv_val = hrv_s.loc[idx] if hrv_s is not None else None
         steps_val = steps_s.loc[idx]
-        frac = (t - t_start).total_seconds() / total_sec  # 0.0 početak, 1.0 kraj
+        frac = (t - t_start).total_seconds() / total_sec
 
         stage = "LIGHT"
 
-        # --- Awake ---
+        # Awake
         if steps_val and steps_val > 0:
             stage = "AWAKE"
             stages.append(stage)
@@ -437,11 +453,9 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
             stages.append(stage)
             continue
 
-        # --- Scoring za DEEP i REM ---
         deep_score = 0
         rem_score = 0
 
-        # Deep: nizak HR, stabilan HR, (po mogućnosti) visok HRV, raniji dio noći
         if hr_val <= hr_low:
             deep_score += 2
         if diff_val <= diff_low:
@@ -451,7 +465,6 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
         if frac < 0.4:
             deep_score += 1
 
-        # REM: viši HR, veća varijacija, niži HRV, kasnije u noći
         if hr_val >= hr_high:
             rem_score += 2
         if diff_val >= diff_high:
@@ -472,7 +485,6 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
 
     s = pd.Series(stages, index=df.index)
 
-    # Smoothing: makni izolirane single-minute skokove
     s_smoothed = s.copy()
     for i in range(1, len(s) - 1):
         if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
@@ -482,7 +494,7 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
 
 
 # =========================
-# ROLLA APP (BLE log + custom staging)
+# Rolla app (BLE)
 # =========================
 
 def rolla_app():
@@ -506,7 +518,6 @@ def rolla_app():
     attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
 
     apply_device_stage(sleep_minutes)
-
     sessions = split_sessions(sleep_minutes, gap_min=30)
     sessions = sorted(sessions, key=lambda s: s[-1].t)
 
@@ -618,17 +629,23 @@ def rolla_app():
 
 
 # =========================
-# OURA API HELPERS
+# Oura helpers
 # =========================
 
 OURA_BASE = "https://api.ouraring.com/v2/usercollection"
 
 
+def get_oura_config():
+    client_id = st.secrets["OURA_CLIENT_ID"]
+    client_secret = st.secrets["OURA_CLIENT_SECRET"]
+    redirect_uri = st.secrets.get(
+        "OURA_REDIRECT_URI",
+        "https://sleepanalyzer-kglbkkvkpvkq9unhaatrpb.streamlit.app/oauth",
+    )
+    return client_id, client_secret, redirect_uri
+
+
 def fetch_oura_sleep(token: str, day: str):
-    """
-    day = '2025-11-15' (YYYY-MM-DD)
-    Vraća prvi sleep period za taj dan.
-    """
     headers = {"Authorization": f"Bearer {token}"}
     params = {"start_date": day, "end_date": day}
     r = requests.get(f"{OURA_BASE}/sleep", headers=headers, params=params)
@@ -640,10 +657,6 @@ def fetch_oura_sleep(token: str, day: str):
 
 
 def fetch_oura_heartrate(token: str, start_iso: str, end_iso: str):
-    """
-    start_iso / end_iso npr. '2025-11-15T22:00:00Z'
-    Vraća pandas DataFrame s kolonama time, hr.
-    """
     headers = {"Authorization": f"Bearer {token}"}
     params = {"start_datetime": start_iso, "end_datetime": end_iso}
     r = requests.get(f"{OURA_BASE}/heartrate", headers=headers, params=params)
@@ -665,9 +678,6 @@ def fetch_oura_heartrate(token: str, start_iso: str, end_iso: str):
 
 
 def summarize_oura_sleep(sleep_json: dict):
-    """
-    Prima jedan objekt iz /sleep endpointa i vraća sažetak.
-    """
     if sleep_json is None:
         return None
 
@@ -701,20 +711,14 @@ def summarize_oura_sleep(sleep_json: dict):
 
 
 # =========================
-# OURA APP (OAuth view)
+# Oura app (OAuth)
 # =========================
 
 def oura_app():
     st.title("🛏️ Sleep Analyzer – Oura API (OAuth)")
 
-    # 1) Credentials from secrets
     try:
-        client_id = st.secrets["OURA_CLIENT_ID"]
-        client_secret = st.secrets["OURA_CLIENT_SECRET"]
-        redirect_uri = st.secrets.get(
-            "OURA_REDIRECT_URI",
-            "https://sleepanalyzer-kglbkkvkpvkq9unhaatrpb.streamlit.app/",
-        )
+        client_id, client_secret, redirect_uri = get_oura_config()
     except Exception:
         st.error("Set OURA_CLIENT_ID, OURA_CLIENT_SECRET and OURA_REDIRECT_URI in Streamlit secrets.")
         st.stop()
@@ -727,7 +731,6 @@ def oura_app():
 
     if "oura_token" not in st.session_state:
         if code:
-            # exchange code for token
             data = {
                 "grant_type": "authorization_code",
                 "code": code,
@@ -749,6 +752,7 @@ def oura_app():
                 st.stop()
 
             st.session_state["oura_token"] = access_token
+            st.experimental_set_query_params()  # očisti ?code=...
             st.success("Oura account connected. You can now load sleep data.")
         else:
             scope = "email personal daily session heartrate"
@@ -775,9 +779,7 @@ def oura_app():
                 )
             st.stop()
 
-    # here we have a token
     token = st.session_state["oura_token"]
-
     st.info("Oura account connected. Pick a date to inspect sleep.")
 
     day = st.date_input("Sleep date", value=date.today())
@@ -817,58 +819,13 @@ def oura_app():
 
 
 # =========================
-# Privacy & Terms pages
-# =========================
-
-def render_privacy_policy():
-    st.title("Privacy Policy")
-    st.write("""
-    ### Sleep Analyzer – Privacy Policy
-
-    This project is a development / testing tool used for personal analysis of sleep data.
-    We do not store, share or process any user data outside of this application.
-    Your Oura API access token is used only to fetch data directly to your browser session
-    and is never saved on any external server.
-
-    **What data is processed?**
-    - Sleep stages
-    - Heart rate data
-    - HRV values
-    - Activity and readiness scores (if requested)
-
-    **Where is the data stored?**  
-    - Only temporarily inside your browser session.
-    - No data is sent to third-party servers.
-
-    **Contact**: minarik.jan@rolla.app  
-    """)
-
-
-def render_terms_of_service():
-    st.title("Terms of Service")
-    st.write("""
-    ### Sleep Analyzer – Terms of Service
-
-    This tool is intended solely for personal experimentation and development.
-    By using this application, you agree that:
-
-    - You are providing your own Oura account access voluntarily
-    - The authors of this tool are not responsible for incorrect or incomplete data
-    - The tool is not a medical device
-    - All data remains your property and is not stored outside your usage session
-
-    For any questions, contact: minarik.jan@rolla.app
-    """)
-
-
-# =========================
 # MAIN
 # =========================
 
 def main():
     st.set_page_config(page_title="Sleep Analyzer", layout="wide")
 
-    # Simple routing for privacy / terms pages
+    # routing za privacy/terms
     params = st.experimental_get_query_params()
     path = params.get("path", [None])[0]
     if path == "privacy":
