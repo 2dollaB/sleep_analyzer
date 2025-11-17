@@ -744,9 +744,12 @@ def oura_app():
             }
             try:
                 r = requests.post(TOKEN_URL, data=data)
-                r.raise_for_status()
             except Exception as e:
-                st.error(f"Error exchanging code for token: {e}")
+                st.error(f"Network error calling token endpoint: {e}")
+                st.stop()
+
+            if r.status_code != 200:
+                st.error(f"Token error {r.status_code}: {r.text}")
                 st.stop()
 
             token_json = r.json()
