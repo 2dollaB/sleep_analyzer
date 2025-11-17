@@ -846,7 +846,7 @@ def oura_app():
 
         # 3b) NEMAMO ni token ni code → pokaži link za login
         else:
-            scope = "email personal daily sleep heartrate"
+            scope = "email personal daily session heartrate sleep"
             # (you can keep "session" too if želiš)
             # scope = "email personal daily sleep session heartrate"
             auth_params = {
