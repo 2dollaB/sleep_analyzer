@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import requests
+import urllib.parse
 
 
 # =========================
@@ -363,8 +364,8 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     """
     v3:
-      - nema globalnog forsiranja postotaka (nema max DEEP / min REM)
-      - samo lokalni signal:
+      - nema globalnog forsiranja postotaka
+      - lokalni signal:
           * HR (razina)
           * dHR (promjena HR)
           * HRV (ako postoji)
@@ -395,7 +396,7 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     # HR derivative (REM i Awake imaju veće oscilacije)
     hr_diff = hr_s.diff().abs().rolling(3, min_periods=1).mean()
 
-    # pragovi (malo konzervativniji)
+    # pragovi
     hr_low = hr_s.quantile(0.25)
     hr_high = hr_s.quantile(0.75)
     hr_very_high = hr_s.quantile(0.90)
@@ -423,7 +424,6 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
         steps_val = steps_s.loc[idx]
         frac = (t - t_start).total_seconds() / total_sec  # 0.0 početak, 1.0 kraj
 
-        # default je sleep (LIGHT) – prvo provjerimo budnost
         stage = "LIGHT"
 
         # --- Awake ---
@@ -461,7 +461,6 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
         if frac > 0.3:
             rem_score += 1
 
-        # odlučivanje – treba veći score i REM/DEEP da bude barem "jači" od LIGHT-a
         if deep_score >= 3 and deep_score > rem_score:
             stage = "DEEP"
         elif rem_score >= 3 and rem_score > deep_score:
@@ -502,15 +501,12 @@ def rolla_app():
         st.error("No 53 packets (sleep data) found in this file.")
         return
 
-    # attach HR / HRV / steps to minutes
     attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=10)
     attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=30)
     attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
 
-    # device staging (samo za usporedbu)
     apply_device_stage(sleep_minutes)
 
-    # split into sessions (na temelju 53)
     sessions = split_sessions(sleep_minutes, gap_min=30)
     sessions = sorted(sessions, key=lambda s: s[-1].t)
 
@@ -524,7 +520,6 @@ def rolla_app():
         )
 
     st.sidebar.header("Session")
-    # default = zadnji session
     default_index = max(0, len(sessions) - 1)
     selected_idx = st.sidebar.selectbox(
         "Choose sleep session",
@@ -538,20 +533,17 @@ def rolla_app():
     df_full["device_stage"] = df_full["stage"]
     df_full["custom_stage"] = compute_custom_stage(df_full)
 
-    # Stage source toggle
     st.sidebar.header("Stage source")
     stage_source = st.sidebar.radio(
         "Use stages from",
         ["Device (cmd 53)", "Custom (HR+HRV+steps)"],
-        index=1,  # default na naš algoritam :)
+        index=1,
     )
 
-    # Info o broju uzoraka
     st.sidebar.caption(
         f"HR samples: {len(hr_samples)} | HRV samples: {len(hrv_samples)} | Step samples: {len(step_samples)}"
     )
 
-    # -------- TIME SLIDER (minute) --------
     min_t, max_t = df_full["time"].min(), df_full["time"].max()
     total_minutes = max(1, int((max_t - min_t).total_seconds() / 60))
 
@@ -568,14 +560,10 @@ def rolla_app():
 
     df_view = df_full[(df_full["time"] >= start_t) & (df_full["time"] <= end_t)].copy()
 
-    # Koju kolonu koristimo kao "stage"?
     stage_col = "device_stage" if stage_source.startswith("Device") else "custom_stage"
     df_view["stage_used"] = df_view[stage_col]
-
-    # za summary i hypnogram uzimamo samo time + stage_used
     df_stage = df_view[["time", "stage_used"]].rename(columns={"stage_used": "stage"})
 
-    # -------- Stage filter --------
     st.sidebar.header("Stages")
     all_stages = ["AWAKE", "REM", "LIGHT", "DEEP"]
     selected_stages = st.sidebar.multiselect(
@@ -595,7 +583,6 @@ def rolla_app():
             st.info("No HR data available for this session.")
         return
 
-    # summary
     start = df_stage["time"].min()
     end = df_stage["time"].max() + timedelta(minutes=1)
     total_min = int((end - start).total_seconds() / 60)
@@ -680,7 +667,6 @@ def fetch_oura_heartrate(token: str, start_iso: str, end_iso: str):
 def summarize_oura_sleep(sleep_json: dict):
     """
     Prima jedan objekt iz /sleep endpointa i vraća sažetak.
-    Točna imena polja mogu ovisiti o Oura verziji – ovdje su tipična.
     """
     if sleep_json is None:
         return None
@@ -707,7 +693,6 @@ def summarize_oura_sleep(sleep_json: dict):
         "awake_min": int(awake_sec / 60) if awake_sec else None,
     }
 
-    # spremimo raw hypnogram ako postoji
     summary["hypnogram_raw"] = (
         sleep_json.get("hypnogram_5min") or sleep_json.get("sleep_phase_5min")
     )
@@ -716,25 +701,86 @@ def summarize_oura_sleep(sleep_json: dict):
 
 
 # =========================
-# OURA APP (API view)
+# OURA APP (OAuth view)
 # =========================
 
 def oura_app():
-    st.title("🛏️ Sleep Analyzer – Oura API")
+    st.title("🛏️ Sleep Analyzer – Oura API (OAuth)")
 
-    st.write("Connect your Oura account via personal access token (for development / comparison).")
+    # 1) Credentials from secrets
+    try:
+        client_id = st.secrets["OURA_CLIENT_ID"]
+        client_secret = st.secrets["OURA_CLIENT_SECRET"]
+        redirect_uri = st.secrets.get(
+            "OURA_REDIRECT_URI",
+            "https://sleepanalyzer-kglbkkvkpvkq9unhaatrpb.streamlit.app/",
+        )
+    except Exception:
+        st.error("Set OURA_CLIENT_ID, OURA_CLIENT_SECRET and OURA_REDIRECT_URI in Streamlit secrets.")
+        st.stop()
 
-    token = st.text_input(
-        "Oura Personal Access Token",
-        type="password",
-        help="Generate it in your Oura account under API / Personal access token.",
-    )
+    AUTH_URL = "https://cloud.ouraring.com/oauth/authorize"
+    TOKEN_URL = "https://api.ouraring.com/oauth/token"
+
+    params = st.experimental_get_query_params()
+    code = params.get("code", [None])[0]
+
+    if "oura_token" not in st.session_state:
+        if code:
+            # exchange code for token
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
+            try:
+                r = requests.post(TOKEN_URL, data=data)
+                r.raise_for_status()
+            except Exception as e:
+                st.error(f"Error exchanging code for token: {e}")
+                st.stop()
+
+            token_json = r.json()
+            access_token = token_json.get("access_token")
+            if not access_token:
+                st.error(f"Token response missing access_token: {token_json}")
+                st.stop()
+
+            st.session_state["oura_token"] = access_token
+            st.success("Oura account connected. You can now load sleep data.")
+        else:
+            scope = "email personal daily session heartrate"
+            auth_params = {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "scope": scope,
+            }
+            auth_url = AUTH_URL + "?" + urllib.parse.urlencode(auth_params)
+
+            st.markdown(
+                """
+                1. Click the button below  
+                2. Log into your Oura account and approve access  
+                3. You will be redirected back to this app  
+                """
+            )
+            if st.button("🔗 Connect Oura account"):
+                st.markdown(f"[Continue to Oura authorization]({auth_url})")
+                st.markdown(
+                    f'<meta http-equiv="refresh" content="0; url={auth_url}">',
+                    unsafe_allow_html=True,
+                )
+            st.stop()
+
+    # here we have a token
+    token = st.session_state["oura_token"]
+
+    st.info("Oura account connected. Pick a date to inspect sleep.")
 
     day = st.date_input("Sleep date", value=date.today())
-
-    if not token:
-        st.info("Enter your Oura token to load data.")
-        return
 
     if st.button("Load Oura sleep"):
         day_str = day.strftime("%Y-%m-%d")
@@ -771,11 +817,66 @@ def oura_app():
 
 
 # =========================
-# MAIN – biraš Rolla ili Oura mod
+# Privacy & Terms pages
+# =========================
+
+def render_privacy_policy():
+    st.title("Privacy Policy")
+    st.write("""
+    ### Sleep Analyzer – Privacy Policy
+
+    This project is a development / testing tool used for personal analysis of sleep data.
+    We do not store, share or process any user data outside of this application.
+    Your Oura API access token is used only to fetch data directly to your browser session
+    and is never saved on any external server.
+
+    **What data is processed?**
+    - Sleep stages
+    - Heart rate data
+    - HRV values
+    - Activity and readiness scores (if requested)
+
+    **Where is the data stored?**  
+    - Only temporarily inside your browser session.
+    - No data is sent to third-party servers.
+
+    **Contact**: minarik.jan@rolla.app  
+    """)
+
+
+def render_terms_of_service():
+    st.title("Terms of Service")
+    st.write("""
+    ### Sleep Analyzer – Terms of Service
+
+    This tool is intended solely for personal experimentation and development.
+    By using this application, you agree that:
+
+    - You are providing your own Oura account access voluntarily
+    - The authors of this tool are not responsible for incorrect or incomplete data
+    - The tool is not a medical device
+    - All data remains your property and is not stored outside your usage session
+
+    For any questions, contact: minarik.jan@rolla.app
+    """)
+
+
+# =========================
+# MAIN
 # =========================
 
 def main():
     st.set_page_config(page_title="Sleep Analyzer", layout="wide")
+
+    # Simple routing for privacy / terms pages
+    params = st.experimental_get_query_params()
+    path = params.get("path", [None])[0]
+    if path == "privacy":
+        render_privacy_policy()
+        return
+    if path == "terms":
+        render_terms_of_service()
+        return
 
     app_mode = st.sidebar.selectbox(
         "Data source",
