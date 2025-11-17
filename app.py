@@ -648,14 +648,62 @@ def get_oura_config():
 
 
 def fetch_oura_sleep(token: str, day: str):
+    """
+    Fetch Oura sleep for given calendar day (debug version).
+    Shows raw HTTP response if something is weird.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     params = {"start_date": day, "end_date": day}
+
+    # ---- 1) /sleep ----
     r = requests.get(f"{OURA_BASE}/sleep", headers=headers, params=params)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
+
+    # Debug: pokaži status + raw tekst
+    st.write("📡 /sleep status:", r.status_code)
+    try:
+        st.write("📡 /sleep raw body:", r.text[:2000])  # skraćeno, da ne bude predugačko
+    except Exception:
+        pass
+
+    if r.status_code != 200:
+        st.error(f"Oura /sleep HTTP {r.status_code}: {r.text}")
         return None
-    return data[0]
+
+    try:
+        json_data = r.json()
+    except Exception as e:
+        st.error(f"Error parsing /sleep JSON: {e}")
+        return None
+
+    sleeps = json_data.get("data", [])
+    if sleeps:
+        # uzmi prvi zapis za taj dan
+        return sleeps[0]
+
+    # ---- 2) Ako nema ničega u /sleep, probaj /daily_sleep ----
+    r2 = requests.get(f"{OURA_BASE}/daily_sleep", headers=headers, params=params)
+
+    st.write("📡 /daily_sleep status:", r2.status_code)
+    try:
+        st.write("📡 /daily_sleep raw body:", r2.text[:2000])
+    except Exception:
+        pass
+
+    if r2.status_code != 200:
+        # ako je i ovo prazno – vratit ćemo None i gore će se ispisati upozorenje
+        return None
+
+    try:
+        json_data2 = r2.json()
+    except Exception:
+        return None
+
+    daily = json_data2.get("data", [])
+    if not daily:
+        return None
+
+    # /daily_sleep je već agregat za dan, pa ga samo vratimo
+    return daily[0]
 
 
 def fetch_oura_heartrate(token: str, start_iso: str, end_iso: str):
