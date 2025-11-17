@@ -729,26 +729,28 @@ def oura_app():
     AUTH_URL = "https://cloud.ouraring.com/oauth/authorize"
     TOKEN_URL = "https://api.ouraring.com/oauth/token"
 
-    # 2) Čitanje query parametara (code nakon povratka iz Oure)
-    #    (možeš kasnije promijeniti u st.query_params; ovo sada radi)
+    # 2) Query parametri (code nakon povratka iz Oure)
+    #    (možeš kasnije prebaciti na st.query_params, ovo sada radi)
     params = st.experimental_get_query_params()
     code = params.get("code", [None])[0]
 
-    # 3) Ako još nemamo token u session_state
-        # 3) Ako još nemamo token u session_state
-    if "oura_token" not in st.session_state:
-        # Ako imamo code (došli smo iz Oura), prikazujemo ga i čekamo potvrdu
+    # Uzmemo eventualni token iz session_state (bez KeyError-a)
+    token = st.session_state.get("oura_token", None)
+
+    # 3) Ako NEMAMO token → moramo odraditi login / exchange
+    if not token:
+        # 3a) Imamo code u URL-u → manualni exchange
         if code:
             st.warning("Authorization code detected in URL. Manual exchange required.")
+
             st.write("**Code:**", code)
             st.write("**Redirect URI (from secrets):**", redirect_uri)
             st.write("**Client ID (from secrets):**", client_id)
-
-            # Pokažemo link pomoću kojeg se korisnik vratio (samo za info)
-            st.write("If this is an old/used code, it will fail. Use 'Connect Oura account' again to generate a new code.")
+            st.write(
+                "If this is an old/used code, it will fail. Use 'Connect Oura account' again to generate a new code."
+            )
 
             if st.button("Exchange code for token now"):
-                # napravimo exchange samo kad korisnik potvrdi
                 data = {
                     "grant_type": "authorization_code",
                     "code": code,
@@ -784,15 +786,42 @@ def oura_app():
                     st.error(f"Token response missing access_token: {token_json}")
                     st.stop()
 
+                # Spremimo token i očistimo ?code= iz URL-a
                 st.session_state["oura_token"] = access_token
                 st.experimental_set_query_params()
                 st.success("Oura account connected. You can now load sleep data.")
             else:
                 st.info("Press the button to try exchanging code for token.")
-            # prekidamo daljnji flow dok se ne izvrši exchange
+
+            # Zaustavi tu – čekamo da user napravi exchange
             st.stop()
 
-    # 4) Ovdje VEĆ imamo access token
+        # 3b) NEMAMO ni token ni code → pokaži link za login
+        else:
+            scope = "email personal daily session heartrate"
+            auth_params = {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "scope": scope,
+            }
+            auth_url = AUTH_URL + "?" + urllib.parse.urlencode(auth_params)
+
+            st.markdown(
+                """
+                1. Click the button below (opens in a new tab)  
+                2. Log into your Oura account and approve access  
+                3. You will be redirected back to this app (same URL)  
+                """
+            )
+
+            st.markdown(
+                f'<a href="{auth_url}" target="_blank"><button>🔗 Connect Oura account</button></a>',
+                unsafe_allow_html=True,
+            )
+            st.stop()
+
+    # 4) Ovdje SIGURNO imamo token u session_state
     token = st.session_state["oura_token"]
     st.info("Oura account connected. Pick a date to inspect sleep.")
 
