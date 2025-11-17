@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict
+from requests.auth import HTTPBasicAuth
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import requests
 import urllib.parse
+
 
 
 # =========================
@@ -728,48 +730,54 @@ def oura_app():
     TOKEN_URL = "https://api.ouraring.com/oauth/token"
 
     # 2) Čitanje query parametara (code nakon povratka iz Oure)
+    #    (možeš kasnije promijeniti u st.query_params; ovo sada radi)
     params = st.experimental_get_query_params()
     code = params.get("code", [None])[0]
 
-    # 3) Ako još nemamo token
+    # 3) Ako još nemamo token u session_state
     if "oura_token" not in st.session_state:
         if code:
-            # Exchange code for token
+            # --- Exchange code za access token ---
             data = {
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": redirect_uri,
+                "redirect_uri": redirect_uri,  # mora biti identičan onom u Oura dev konzoli
             }
 
             try:
-                # Preporučeni način: Basic Auth s client_id + client_secret
                 r = requests.post(
                     TOKEN_URL,
                     data=data,
-                    auth=(client_id, client_secret),
+                    auth=HTTPBasicAuth(client_id, client_secret),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
             except Exception as e:
                 st.error(f"Network error calling token endpoint: {e}")
                 st.stop()
 
             if r.status_code != 200:
-                # >>> OVDJE ćemo konačno vidjeti pravi razlog (JSON/tekst)
+                # pokaži full tekst greške iz Oure
                 st.error(f"Token error {r.status_code}: {r.text}")
                 st.stop()
 
-            token_json = r.json()
-            access_token = token_json.get("access_token")
+            try:
+                token_json = r.json()
+            except Exception:
+                st.error(f"Cannot parse token JSON: {r.text}")
+                st.stop()
 
+            access_token = token_json.get("access_token")
             if not access_token:
                 st.error(f"Token response missing access_token: {token_json}")
                 st.stop()
 
             st.session_state["oura_token"] = access_token
+            # makni ?code= iz URL-a da se ne koristi ponovno
             st.experimental_set_query_params()
             st.success("Oura account connected. You can now load sleep data.")
 
         else:
-            # No code → create login link
+            # --- Nemamo ni token ni code → ponudimo login link ---
             scope = "email personal daily session heartrate"
             auth_params = {
                 "response_type": "code",
@@ -783,17 +791,18 @@ def oura_app():
                 """
                 1. Click the button below (opens in a new tab)  
                 2. Log into your Oura account and approve access  
-                3. You will be redirected back to this app  
+                3. You will be redirected back to this app (same URL)  
                 """
             )
 
+            # otvorit će se u novom tabu, izvan iframe-a
             st.markdown(
                 f'<a href="{auth_url}" target="_blank"><button>🔗 Connect Oura account</button></a>',
                 unsafe_allow_html=True,
             )
             st.stop()
 
-    # 4) Here we already have token
+    # 4) Ovdje VEĆ imamo access token
     token = st.session_state["oura_token"]
     st.info("Oura account connected. Pick a date to inspect sleep.")
 
@@ -802,6 +811,7 @@ def oura_app():
     if st.button("Load Oura sleep"):
         day_str = day.strftime("%Y-%m-%d")
 
+        # Sleep blok
         try:
             sleep_json = fetch_oura_sleep(token, day_str)
         except Exception as e:
@@ -817,6 +827,7 @@ def oura_app():
         st.subheader("Sleep summary (Oura)")
         st.json(summary)
 
+        # Heart rate tijekom spavanja
         start = summary["start"]
         end = summary["end"]
 
