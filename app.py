@@ -735,71 +735,61 @@ def oura_app():
     code = params.get("code", [None])[0]
 
     # 3) Ako još nemamo token u session_state
+        # 3) Ako još nemamo token u session_state
     if "oura_token" not in st.session_state:
+        # Ako imamo code (došli smo iz Oura), prikazujemo ga i čekamo potvrdu
         if code:
-            # --- Exchange code za access token ---
-            data = {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,  # mora biti identičan onom u Oura dev konzoli
-            }
+            st.warning("Authorization code detected in URL. Manual exchange required.")
+            st.write("**Code:**", code)
+            st.write("**Redirect URI (from secrets):**", redirect_uri)
+            st.write("**Client ID (from secrets):**", client_id)
 
-            try:
-                r = requests.post(
-                    TOKEN_URL,
-                    data=data,
-                    auth=HTTPBasicAuth(client_id, client_secret),
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                )
-            except Exception as e:
-                st.error(f"Network error calling token endpoint: {e}")
-                st.stop()
+            # Pokažemo link pomoću kojeg se korisnik vratio (samo za info)
+            st.write("If this is an old/used code, it will fail. Use 'Connect Oura account' again to generate a new code.")
 
-            if r.status_code != 200:
-                # pokaži full tekst greške iz Oure
-                st.error(f"Token error {r.status_code}: {r.text}")
-                st.stop()
+            if st.button("Exchange code for token now"):
+                # napravimo exchange samo kad korisnik potvrdi
+                data = {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                }
+                try:
+                    r = requests.post(
+                        TOKEN_URL,
+                        data=data,
+                        auth=HTTPBasicAuth(client_id, client_secret),
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=15,
+                    )
+                except Exception as e:
+                    st.error(f"Network error calling token endpoint: {e}")
+                    st.stop()
 
-            try:
-                token_json = r.json()
-            except Exception:
-                st.error(f"Cannot parse token JSON: {r.text}")
-                st.stop()
+                st.write(f"HTTP {r.status_code} — response text:")
+                st.code(r.text)
 
-            access_token = token_json.get("access_token")
-            if not access_token:
-                st.error(f"Token response missing access_token: {token_json}")
-                st.stop()
+                if r.status_code != 200:
+                    st.error("Token exchange failed. See response above.")
+                    st.stop()
 
-            st.session_state["oura_token"] = access_token
-            # makni ?code= iz URL-a da se ne koristi ponovno
-            st.experimental_set_query_params()
-            st.success("Oura account connected. You can now load sleep data.")
+                try:
+                    token_json = r.json()
+                except Exception:
+                    st.error(f"Cannot parse token JSON: {r.text}")
+                    st.stop()
 
-        else:
-            # --- Nemamo ni token ni code → ponudimo login link ---
-            scope = "email personal daily session heartrate"
-            auth_params = {
-                "response_type": "code",
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "scope": scope,
-            }
-            auth_url = AUTH_URL + "?" + urllib.parse.urlencode(auth_params)
+                access_token = token_json.get("access_token")
+                if not access_token:
+                    st.error(f"Token response missing access_token: {token_json}")
+                    st.stop()
 
-            st.markdown(
-                """
-                1. Click the button below (opens in a new tab)  
-                2. Log into your Oura account and approve access  
-                3. You will be redirected back to this app (same URL)  
-                """
-            )
-
-            # otvorit će se u novom tabu, izvan iframe-a
-            st.markdown(
-                f'<a href="{auth_url}" target="_blank"><button>🔗 Connect Oura account</button></a>',
-                unsafe_allow_html=True,
-            )
+                st.session_state["oura_token"] = access_token
+                st.experimental_set_query_params()
+                st.success("Oura account connected. You can now load sleep data.")
+            else:
+                st.info("Press the button to try exchanging code for token.")
+            # prekidamo daljnji flow dok se ne izvrši exchange
             st.stop()
 
     # 4) Ovdje VEĆ imamo access token
