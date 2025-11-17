@@ -733,36 +733,40 @@ def oura_app():
 
     # 3) Ako još nemamo token
     if "oura_token" not in st.session_state:
-        if code:
-            # --- Exchange code za access token ---
-            data = {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-            }
+            if code:
+        # --- Exchange code za access token ---
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
 
         try:
-            # client_id + client_secret šaljemo kroz Basic Auth
+            # Proper OAuth token request using Basic Auth
             r = requests.post(TOKEN_URL, data=data, auth=(client_id, client_secret))
             r.raise_for_status()
+
         except Exception as e:
-            # prikaži raw JSON da vidimo ako još nešto ne valja
-        try:
-            err_json = r.json()
-        except Exception:
-            err_json = None
-            st.error(f"Token error {r.status_code}: {err_json or e}")
+            # Try to extract Oura JSON error
+            try:
+                err_json = r.json()
+            except Exception:
+                err_json = str(e)
+
+            st.error(f"Token error {r.status_code}: {err_json}")
             st.stop()
 
-            token_json = r.json()
-            access_token = token_json.get("access_token")
-            if not access_token:
-                st.error(f"Token response missing access_token: {token_json}")
-                st.stop()
+        # Extract access token
+        token_json = r.json()
+        access_token = token_json.get("access_token")
 
-            st.session_state["oura_token"] = access_token
-            st.experimental_set_query_params()  # makni ?code= iz URL-a
-            st.success("Oura account connected. You can now load sleep data.")
+        if not access_token:
+            st.error(f"Token response missing access_token: {token_json}")
+            st.stop()
+
+        st.session_state["oura_token"] = access_token
+        st.experimental_set_query_params()
+        st.success("Oura account connected. You can now load sleep data.")
         else:
             # --- NEMAMO CODE → prikaz Oura login linka ---
             scope = "email personal daily session heartrate"
