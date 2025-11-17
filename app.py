@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import requests
 
 
 # =========================
@@ -73,7 +74,7 @@ class StepSample:
 
 
 # =========================
-# Parsing log (53 / 55 / 56 / 52)
+# Parsing Rolla log (53 / 55 / 56 / 52)
 # =========================
 
 def parse_log_text(text: str):
@@ -356,7 +357,7 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
 
 # =========================
-# CUSTOM ALGORITAM v2.0
+# CUSTOM ALGORITAM v3 (Rolla – HR+HRV+steps)
 # =========================
 
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
@@ -481,24 +482,17 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     return s_smoothed
 
 
-
 # =========================
-# Streamlit UI
+# ROLLA APP (BLE log + custom staging)
 # =========================
 
-def main():
-    st.set_page_config(page_title="Sleep Analyzer", layout="wide")
-    st.title("🛏️ Sleep Analyzer – Device vs Custom v2.0")
+def rolla_app():
+    st.title("🛏️ Sleep Analyzer – Rolla band")
 
-    st.write(
-        "Upload raw BLE log (.txt) from your band and compare device staging (cmd 53) "
-        "vs our custom HR+HRV algorithm."
-    )
-
-    uploaded = st.file_uploader("Upload sleep log (.txt)", type=["txt"])
+    uploaded = st.file_uploader("Upload Rolla BLE sleep log (.txt)", type=["txt"])
 
     if not uploaded:
-        st.info("Waiting for file…")
+        st.info("Upload a BLE log file to analyze sleep.")
         return
 
     text = uploaded.read().decode("utf-8", errors="ignore")
@@ -508,7 +502,7 @@ def main():
         st.error("No 53 packets (sleep data) found in this file.")
         return
 
-    # zalijepi HR / HRV / steps na minute
+    # attach HR / HRV / steps to minutes
     attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=10)
     attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=30)
     attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
@@ -525,10 +519,12 @@ def main():
         df_tmp = build_dataframe(sess)
         s_start = df_tmp["time"].min()
         s_end = df_tmp["time"].max()
-        session_labels.append(f"Session {i + 1}  ({s_start.strftime('%Y-%m-%d %H:%M')} – {s_end.strftime('%H:%M')})")
+        session_labels.append(
+            f"Session {i + 1}  ({s_start.strftime('%Y-%m-%d %H:%M')} – {s_end.strftime('%H:%M')})"
+        )
 
     st.sidebar.header("Session")
-    # ✅ default = zadnji session
+    # default = zadnji session
     default_index = max(0, len(sessions) - 1)
     selected_idx = st.sidebar.selectbox(
         "Choose sleep session",
@@ -546,7 +542,7 @@ def main():
     st.sidebar.header("Stage source")
     stage_source = st.sidebar.radio(
         "Use stages from",
-        ["Device (cmd 53)", "Custom v2 (HR+HRV)"],
+        ["Device (cmd 53)", "Custom (HR+HRV+steps)"],
         index=1,  # default na naš algoritam :)
     )
 
@@ -632,6 +628,164 @@ def main():
 
     with st.expander("Debug table (per minute)"):
         st.dataframe(df_view.reset_index(drop=True))
+
+
+# =========================
+# OURA API HELPERS
+# =========================
+
+OURA_BASE = "https://api.ouraring.com/v2/usercollection"
+
+
+def fetch_oura_sleep(token: str, day: str):
+    """
+    day = '2025-11-15' (YYYY-MM-DD)
+    Vraća prvi sleep period za taj dan.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"start_date": day, "end_date": day}
+    r = requests.get(f"{OURA_BASE}/sleep", headers=headers, params=params)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    if not data:
+        return None
+    return data[0]
+
+
+def fetch_oura_heartrate(token: str, start_iso: str, end_iso: str):
+    """
+    start_iso / end_iso npr. '2025-11-15T22:00:00Z'
+    Vraća pandas DataFrame s kolonama time, hr.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"start_datetime": start_iso, "end_datetime": end_iso}
+    r = requests.get(f"{OURA_BASE}/heartrate", headers=headers, params=params)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    if not data:
+        return pd.DataFrame(columns=["time", "hr"])
+
+    rows = []
+    for row in data:
+        ts = row.get("timestamp")
+        hr = row.get("bpm")
+        if ts is None or hr is None:
+            continue
+        rows.append({"time": pd.to_datetime(ts), "hr": hr})
+
+    df = pd.DataFrame(rows).sort_values("time")
+    return df
+
+
+def summarize_oura_sleep(sleep_json: dict):
+    """
+    Prima jedan objekt iz /sleep endpointa i vraća sažetak.
+    Točna imena polja mogu ovisiti o Oura verziji – ovdje su tipična.
+    """
+    if sleep_json is None:
+        return None
+
+    start = pd.to_datetime(sleep_json.get("bedtime_start"))
+    end = pd.to_datetime(sleep_json.get("bedtime_end"))
+
+    total_sleep_sec = (
+        sleep_json.get("total_sleep_duration")
+        or sleep_json.get("duration")
+    )
+    rem_sec = sleep_json.get("rem_sleep_duration")
+    deep_sec = sleep_json.get("deep_sleep_duration")
+    light_sec = sleep_json.get("light_sleep_duration")
+    awake_sec = sleep_json.get("awake_time")
+
+    summary = {
+        "start": start,
+        "end": end,
+        "total_sleep_min": int(total_sleep_sec / 60) if total_sleep_sec else None,
+        "rem_min": int(rem_sec / 60) if rem_sec else None,
+        "deep_min": int(deep_sec / 60) if deep_sec else None,
+        "light_min": int(light_sec / 60) if light_sec else None,
+        "awake_min": int(awake_sec / 60) if awake_sec else None,
+    }
+
+    # spremimo raw hypnogram ako postoji
+    summary["hypnogram_raw"] = (
+        sleep_json.get("hypnogram_5min") or sleep_json.get("sleep_phase_5min")
+    )
+
+    return summary
+
+
+# =========================
+# OURA APP (API view)
+# =========================
+
+def oura_app():
+    st.title("🛏️ Sleep Analyzer – Oura API")
+
+    st.write("Connect your Oura account via personal access token (for development / comparison).")
+
+    token = st.text_input(
+        "Oura Personal Access Token",
+        type="password",
+        help="Generate it in your Oura account under API / Personal access token.",
+    )
+
+    day = st.date_input("Sleep date", value=date.today())
+
+    if not token:
+        st.info("Enter your Oura token to load data.")
+        return
+
+    if st.button("Load Oura sleep"):
+        day_str = day.strftime("%Y-%m-%d")
+        try:
+            sleep_json = fetch_oura_sleep(token, day_str)
+        except Exception as e:
+            st.error(f"Error fetching sleep: {e}")
+            return
+
+        if sleep_json is None:
+            st.warning("No Oura sleep data found for that date.")
+            return
+
+        summary = summarize_oura_sleep(sleep_json)
+        st.subheader("Sleep summary (Oura)")
+        st.json(summary)
+
+        start = summary["start"]
+        end = summary["end"]
+        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        try:
+            df_hr = fetch_oura_heartrate(token, start_iso, end_iso)
+        except Exception as e:
+            st.error(f"Error fetching heartrate: {e}")
+            return
+
+        if not df_hr.empty:
+            st.subheader("Heart rate during sleep (Oura)")
+            st.line_chart(df_hr.set_index("time")["hr"])
+        else:
+            st.info("No HR data returned from Oura for that interval.")
+
+
+# =========================
+# MAIN – biraš Rolla ili Oura mod
+# =========================
+
+def main():
+    st.set_page_config(page_title="Sleep Analyzer", layout="wide")
+
+    app_mode = st.sidebar.selectbox(
+        "Data source",
+        ["Rolla band (BLE log)", "Oura API"],
+    )
+
+    if app_mode.startswith("Rolla"):
+        rolla_app()
+    else:
+        oura_app()
 
 
 if __name__ == "__main__":
