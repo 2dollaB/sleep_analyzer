@@ -733,47 +733,36 @@ def oura_app():
 
     # 3) Ako još nemamo token
     if "oura_token" not in st.session_state:
-            if code:
-        # --- Exchange code za access token ---
-        data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-        }
+        if code:
+            # Exchange code for token
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
 
-        try:
-            # Token request with HTTP Basic auth (required by Oura)
-            r = requests.post(
-                TOKEN_URL,
-                data=data,
-                auth=(client_id, client_secret)
-            )
-            r.raise_for_status()
-
-        except Exception as e:
-            # Try reading JSON error payload from Oura
             try:
-                err_json = r.json()
-            except Exception:
-                err_json = str(e)
+                r = requests.post(TOKEN_URL, data=data)
+                r.raise_for_status()
+            except Exception as e:
+                st.error(f"Error exchanging code for token: {e}")
+                st.stop()
 
-            st.error(f"Token error {r.status_code}: {err_json}")
-            st.stop()
+            token_json = r.json()
+            access_token = token_json.get("access_token")
 
-        # Extract token
-        token_json = r.json()
-        access_token = token_json.get("access_token")
+            if not access_token:
+                st.error(f"Token response missing access_token: {token_json}")
+                st.stop()
 
-        if not access_token:
-            st.error(f"Token response missing access_token: {token_json}")
-            st.stop()
+            st.session_state["oura_token"] = access_token
+            st.experimental_set_query_params()   # Remove ?code=
+            st.success("Oura account connected. You can now load sleep data.")
 
-        st.session_state["oura_token"] = access_token
-        st.experimental_set_query_params()  # remove ?code=
-        st.success("Oura account connected. You can now load sleep data.")
-        return
         else:
-            # --- NEMAMO CODE → prikaz Oura login linka ---
+            # No code → create login link
             scope = "email personal daily session heartrate"
             auth_params = {
                 "response_type": "code",
@@ -787,18 +776,17 @@ def oura_app():
                 """
                 1. Click the button below (opens in a new tab)  
                 2. Log into your Oura account and approve access  
-                3. You will be redirected back to this app (same URL)  
+                3. You will be redirected back to this app  
                 """
             )
 
-            # 🔑 VAŽNO: OTVARA SE U NOVOM TABU, NE U IFRAME-U
             st.markdown(
                 f'<a href="{auth_url}" target="_blank"><button>🔗 Connect Oura account</button></a>',
                 unsafe_allow_html=True,
             )
             st.stop()
 
-    # 4) Ovdje VEĆ imamo token
+    # 4) Here we already have token
     token = st.session_state["oura_token"]
     st.info("Oura account connected. Pick a date to inspect sleep.")
 
@@ -806,6 +794,7 @@ def oura_app():
 
     if st.button("Load Oura sleep"):
         day_str = day.strftime("%Y-%m-%d")
+
         try:
             sleep_json = fetch_oura_sleep(token, day_str)
         except Exception as e:
@@ -817,11 +806,13 @@ def oura_app():
             return
 
         summary = summarize_oura_sleep(sleep_json)
+
         st.subheader("Sleep summary (Oura)")
         st.json(summary)
 
         start = summary["start"]
         end = summary["end"]
+
         start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
