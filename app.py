@@ -739,18 +739,20 @@ def oura_app():
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": redirect_uri,
-                "client_id": client_id,
-                "client_secret": client_secret,
             }
-            try:
-                r = requests.post(TOKEN_URL, data=data)
-            except Exception as e:
-                st.error(f"Network error calling token endpoint: {e}")
-                st.stop()
 
-            if r.status_code != 200:
-                st.error(f"Token error {r.status_code}: {r.text}")
-                st.stop()
+        try:
+            # client_id + client_secret šaljemo kroz Basic Auth
+            r = requests.post(TOKEN_URL, data=data, auth=(client_id, client_secret))
+            r.raise_for_status()
+        except Exception as e:
+            # prikaži raw JSON da vidimo ako još nešto ne valja
+        try:
+            err_json = r.json()
+        except Exception:
+            err_json = None
+            st.error(f"Token error {r.status_code}: {err_json or e}")
+            st.stop()
 
             token_json = r.json()
             access_token = token_json.get("access_token")
