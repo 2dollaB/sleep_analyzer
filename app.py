@@ -717,6 +717,7 @@ def summarize_oura_sleep(sleep_json: dict):
 def oura_app():
     st.title("🛏️ Sleep Analyzer – Oura API (OAuth)")
 
+    # 1) Credentials
     try:
         client_id, client_secret, redirect_uri = get_oura_config()
     except Exception:
@@ -726,11 +727,14 @@ def oura_app():
     AUTH_URL = "https://cloud.ouraring.com/oauth/authorize"
     TOKEN_URL = "https://api.ouraring.com/oauth/token"
 
+    # 2) Čitanje query parametara (code nakon povratka iz Oure)
     params = st.experimental_get_query_params()
     code = params.get("code", [None])[0]
 
+    # 3) Ako još nemamo token
     if "oura_token" not in st.session_state:
         if code:
+            # --- Exchange code za access token ---
             data = {
                 "grant_type": "authorization_code",
                 "code": code,
@@ -752,9 +756,10 @@ def oura_app():
                 st.stop()
 
             st.session_state["oura_token"] = access_token
-            st.experimental_set_query_params()  # očisti ?code=...
+            st.experimental_set_query_params()  # makni ?code= iz URL-a
             st.success("Oura account connected. You can now load sleep data.")
         else:
+            # --- NEMAMO CODE → prikaz Oura login linka ---
             scope = "email personal daily session heartrate"
             auth_params = {
                 "response_type": "code",
@@ -766,19 +771,20 @@ def oura_app():
 
             st.markdown(
                 """
-                1. Click the button below  
+                1. Click the button below (opens in a new tab)  
                 2. Log into your Oura account and approve access  
-                3. You will be redirected back to this app  
+                3. You will be redirected back to this app (same URL)  
                 """
             )
-            if st.button("🔗 Connect Oura account"):
-                st.markdown(f"[Continue to Oura authorization]({auth_url})")
-                st.markdown(
-                    f'<meta http-equiv="refresh" content="0; url={auth_url}">',
-                    unsafe_allow_html=True,
-                )
+
+            # 🔑 VAŽNO: OTVARA SE U NOVOM TABU, NE U IFRAME-U
+            st.markdown(
+                f'<a href="{auth_url}" target="_blank"><button>🔗 Connect Oura account</button></a>',
+                unsafe_allow_html=True,
+            )
             st.stop()
 
+    # 4) Ovdje VEĆ imamo token
     token = st.session_state["oura_token"]
     st.info("Oura account connected. Pick a date to inspect sleep.")
 
