@@ -742,12 +742,16 @@ def oura_app():
         }
 
         try:
-            # Proper OAuth token request using Basic Auth
-            r = requests.post(TOKEN_URL, data=data, auth=(client_id, client_secret))
+            # Token request with HTTP Basic auth (required by Oura)
+            r = requests.post(
+                TOKEN_URL,
+                data=data,
+                auth=(client_id, client_secret)
+            )
             r.raise_for_status()
 
         except Exception as e:
-            # Try to extract Oura JSON error
+            # Try reading JSON error payload from Oura
             try:
                 err_json = r.json()
             except Exception:
@@ -756,7 +760,7 @@ def oura_app():
             st.error(f"Token error {r.status_code}: {err_json}")
             st.stop()
 
-        # Extract access token
+        # Extract token
         token_json = r.json()
         access_token = token_json.get("access_token")
 
@@ -765,8 +769,9 @@ def oura_app():
             st.stop()
 
         st.session_state["oura_token"] = access_token
-        st.experimental_set_query_params()
+        st.experimental_set_query_params()  # remove ?code=
         st.success("Oura account connected. You can now load sleep data.")
+        return
         else:
             # --- NEMAMO CODE → prikaz Oura login linka ---
             scope = "email personal daily session heartrate"
