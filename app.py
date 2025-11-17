@@ -739,15 +739,22 @@ def oura_app():
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": redirect_uri,
-                "client_id": client_id,
-                "client_secret": client_secret,
             }
 
             try:
-                r = requests.post(TOKEN_URL, data=data)
-                r.raise_for_status()
+                # Preporučeni način: Basic Auth s client_id + client_secret
+                r = requests.post(
+                    TOKEN_URL,
+                    data=data,
+                    auth=(client_id, client_secret),
+                )
             except Exception as e:
-                st.error(f"Error exchanging code for token: {e}")
+                st.error(f"Network error calling token endpoint: {e}")
+                st.stop()
+
+            if r.status_code != 200:
+                # >>> OVDJE ćemo konačno vidjeti pravi razlog (JSON/tekst)
+                st.error(f"Token error {r.status_code}: {r.text}")
                 st.stop()
 
             token_json = r.json()
@@ -758,7 +765,7 @@ def oura_app():
                 st.stop()
 
             st.session_state["oura_token"] = access_token
-            st.experimental_set_query_params()   # Remove ?code=
+            st.experimental_set_query_params()
             st.success("Oura account connected. You can now load sleep data.")
 
         else:
