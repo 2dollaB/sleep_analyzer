@@ -161,10 +161,10 @@ def parse_log_text(text: str):
                 try:
                     dt = parse_device_datetime(tokens, 3)   # YY MM DD HH mm SS (BCD)
                     hrv_val = int(tokens[9], 16)            # D1 = HRV
-                    # Optional fields exist on some firmwares (not used yet):
-                    # fatigue = int(tokens[12], 16) if len(tokens) > 12 else None
-                    # sys_bp  = int(tokens[13], 16) if len(tokens) > 13 else None
-                    # dia_bp  = int(tokens[14], 16) if len(tokens) > 14 else None
+                    # Optional fields (not used, ali ostavljamo kao reference):
+                    # fatigue = int(tokens[12], 16) if len(tokens) > 12 else None  # D4
+                    # sys_bp  = int(tokens[13], 16) if len(tokens) > 13 else None  # D5
+                    # dia_bp  = int(tokens[14], 16) if len(tokens) > 14 else None  # D6
                     if 0 <= hrv_val <= 255:
                         hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
                 except Exception:
@@ -385,7 +385,7 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
 
 # =========================
-# Custom staging (v3 – same as before)
+# Custom staging (v3 – same rules as dosad)
 # =========================
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     df = df.copy()
@@ -488,24 +488,149 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
 
 
 # =========================
-# Debug helpers
+# HRV diagnostics helpers
 # =========================
-def debug_gaps(samples, name, start_t, end_t):
-    ts = sorted([s.t for s in samples if start_t <= s.t <= end_t])
-    if len(ts) < 2:
-        st.info(f"Not enough {name} points in selected range.")
+def hrv_diagnostics_from_samples(samples: List[HrvSample], title: str):
+    st.markdown(f"#### {title}")
+    if not samples:
+        st.info("No HRV samples found.")
         return
-    gaps = [(ts[i] - ts[i - 1]).total_seconds() / 60 for i in range(1, len(ts))]
-    st.markdown(
-        f"**{name} gaps (minutes)**: "
-        f"min={min(gaps):.2f}, median={pd.Series(gaps).median():.2f}, max={max(gaps):.2f}"
+    df = pd.DataFrame({"time": [s.t for s in samples], "hrv": [s.hrv for s in samples]}).sort_values("time")
+    # Gaps
+    gaps = df["time"].diff().dt.total_seconds().div(60.0).iloc[1:]
+    if len(gaps) > 0:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("HRV points", f"{len(df)}")
+        c2.metric("Min gap", f"{gaps.min():.2f} min")
+        c3.metric("Median gap", f"{gaps.median():.2f} min")
+        c4.metric("Max gap", f"{gaps.max():.2f} min")
+        st.caption(f"Range: {df['time'].min()} → {df['time'].max()}")
+        # Gap distribution table (rounded to 0.1)
+        dist = (
+            gaps.round(1)
+            .value_counts()
+            .sort_index()
+            .rename_axis("gap_min_rounded")
+            .reset_index(name="count")
+        )
+        st.write("Gap distribution (rounded to 0.1 min):")
+        st.dataframe(dist, use_container_width=True)
+    else:
+        st.info("Not enough HRV points to compute gaps.")
+
+    # Runs of identical consecutive HRV values
+    df["prev"] = df["hrv"].shift(1)
+    df["same"] = df["hrv"] == df["prev"]
+    run_id = (~df["same"]).cumsum()
+    runs = (
+        df.groupby(run_id)
+        .agg(start=("time", "min"), end=("time", "max"), value=("hrv", "first"), length=("hrv", "size"))
+        .reset_index(drop=True)
     )
-    st.dataframe(
-        pd.Series([round(g, 1) for g in gaps], name="gap_min")
+    runs2 = runs[runs["length"] >= 2].sort_values(["length", "start"], ascending=[False, True])
+    st.write("Consecutive identical HRV runs (length ≥ 2):")
+    st.dataframe(runs2, use_container_width=True)
+
+    # Preview first 50 HRV rows
+    st.write("First 50 HRV rows:")
+    st.dataframe(df[["time", "hrv"]].head(50), use_container_width=True)
+
+
+def hrv_diagnostics_from_csv(uploaded_csv):
+    st.markdown("#### CSV HRV diagnostics (optional)")
+    try:
+        df = pd.read_csv(uploaded_csv)
+    except Exception as e:
+        st.error(f"CSV read error: {e}")
+        return
+
+    st.caption("Detected columns:")
+    st.code(", ".join(df.columns.astype(str)))
+
+    # Heuristic column pickers
+    def pick_time_column(df):
+        candidates = [c for c in df.columns if any(k in c.lower() for k in ["time", "timestamp", "datetime", "date", "stamp"])]
+        best_col, best_valid, best_parsed = None, -1, None
+        for c in (candidates or list(df.columns)):
+            parsed = pd.to_datetime(df[c], errors="coerce")
+            valid = parsed.notna().sum()
+            if valid > best_valid:
+                best_col, best_valid, best_parsed = c, valid, parsed
+        return best_col, best_parsed
+
+    def pick_numeric_column(df, keywords):
+        for c in df.columns:
+            lc = c.lower()
+            if any(k in lc for k in keywords):
+                s = pd.to_numeric(df[c], errors="coerce")
+                if s.notna().sum() > 0:
+                    return c, s
+        return None, None
+
+    time_col, time_parsed = pick_time_column(df)
+    hr_col, hr_series = pick_numeric_column(df, ["hr", "heart", "bpm"])
+    hrv_col, hrv_series = pick_numeric_column(df, ["hrv", "rmssd", "sdnn"])
+    steps_col, steps_series = pick_numeric_column(df, ["step"])
+
+    st.write(
+        f"- time: **{time_col}** | hr: **{hr_col}** | hrv: **{hrv_col}** | steps: **{steps_col}**"
+    )
+
+    tidy = pd.DataFrame(
+        {
+            "time": time_parsed if time_parsed is not None else pd.NaT,
+            "hr": hr_series if hr_series is not None else pd.NA,
+            "hrv": hrv_series if hrv_series is not None else pd.NA,
+            "steps": steps_series if steps_series is not None else pd.NA,
+        }
+    ).dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("rows_total", len(df))
+    c2.metric("rows_with_time", len(tidy))
+    c3.metric("hr_non_null", int(tidy["hr"].notna().sum()))
+    c4.metric("hrv_non_null", int(tidy["hrv"].notna().sum()))
+
+    hrv_present = tidy.dropna(subset=["hrv"]).copy()
+    if hrv_present.empty:
+        st.warning("No HRV in CSV (all empty after time parsing).")
+        return
+
+    gaps = hrv_present["time"].diff().dt.total_seconds().div(60.0).iloc[1:]
+    cc1, cc2, cc3, cc4 = st.columns(4)
+    cc1.metric("HRV points", f"{len(hrv_present)}")
+    if len(gaps) > 0:
+        cc2.metric("Min gap", f"{gaps.min():.2f} min")
+        cc3.metric("Median gap", f"{gaps.median():.2f} min")
+        cc4.metric("Max gap", f"{gaps.max():.2f} min")
+    st.caption(f"Range: {hrv_present['time'].min()} → {hrv_present['time'].max()}")
+
+    dist = (
+        gaps.round(1)
         .value_counts()
         .sort_index()
-        .to_frame("count")
+        .rename_axis("gap_min_rounded")
+        .reset_index(name="count")
     )
+    st.write("Gap distribution (rounded to 0.1 min):")
+    st.dataframe(dist, use_container_width=True)
+
+    # Runs of identical values
+    hrv_present["prev"] = hrv_present["hrv"].shift(1)
+    hrv_present["same"] = hrv_present["hrv"] == hrv_present["prev"]
+    run_id = (~hrv_present["same"]).cumsum()
+    runs = (
+        hrv_present.groupby(run_id)
+        .agg(start=("time", "min"), end=("time", "max"), value=("hrv", "first"), length=("hrv", "size"))
+        .reset_index(drop=True)
+    )
+    runs2 = runs[runs["length"] >= 2].sort_values(["length", "start"], ascending=[False, True])
+
+    st.write("Consecutive identical HRV runs (length ≥ 2):")
+    st.dataframe(runs2, use_container_width=True)
+
+    st.write("First 50 CSV HRV rows:")
+    st.dataframe(hrv_present[["time", "hrv"]].head(50), use_container_width=True)
 
 
 # =========================
@@ -529,8 +654,8 @@ def rolla_app():
         return
 
     # attach with realistic tolerances
-    attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=5)    # HR ~ every 2 min
-    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=15) # HRV ~ every 10 min
+    attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=5)     # HR ~ every 2 min
+    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=15)  # HRV ~ every 10 min
     attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
 
     apply_device_stage(sleep_minutes)
@@ -602,8 +727,33 @@ def rolla_app():
 
     # --- Diagnostics --------------------------------------------------------
     with st.expander("Signal sanity checks (session range)"):
-        debug_gaps(hr_samples, "HR", start_t, end_t)
-        debug_gaps(hrv_samples, "HRV", start_t, end_t)
+        # HR gaps
+        ts_hr = sorted([s.t for s in hr_samples if start_t <= s.t <= end_t])
+        if len(ts_hr) >= 2:
+            gaps_hr = pd.Series(ts_hr).diff().dt.total_seconds().div(60.0).iloc[1:]
+            st.write(
+                f"**HR gaps (min)** — min={gaps_hr.min():.2f}, median={gaps_hr.median():.2f}, max={gaps_hr.max():.2f}"
+            )
+        else:
+            st.info("Not enough HR points in selected range.")
+
+        # HRV gaps
+        ts_hrv = sorted([s.t for s in hrv_samples if start_t <= s.t <= end_t])
+        if len(ts_hrv) >= 2:
+            gaps_hrv = pd.Series(ts_hrv).diff().dt.total_seconds().div(60.0).iloc[1:]
+            st.write(
+                f"**HRV gaps (min)** — min={gaps_hrv.min():.2f}, median={gaps_hrv.median():.2f}, max={gaps_hrv.max():.2f}"
+            )
+        else:
+            st.info("Not enough HRV points in selected range.")
+
+    with st.expander("HRV detailed diagnostics (BLE log)"):
+        hrv_diagnostics_from_samples(hrv_samples, "BLE HRV samples")
+
+    with st.expander("CSV diagnostics (optional)"):
+        csv_up = st.file_uploader("Upload CSV export (optional)", type=["csv"], key="csv_diag")
+        if csv_up is not None:
+            hrv_diagnostics_from_csv(csv_up)
 
     if df_stage.empty:
         st.warning("No data in selected time/stage range.")
