@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict
-from requests.auth import HTTPBasicAuth
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import requests
-import urllib.parse
-
 
 
 # =========================
@@ -24,8 +20,6 @@ def render_privacy_policy():
 
     This project is a development / testing tool used for personal analysis of sleep data.
     We do not store, share or process any user data outside of this application.
-    Your Oura API access token is used only to fetch data directly to your browser session
-    and is never saved on any external server.
 
     **What data is processed?**
     - Sleep stages
@@ -48,7 +42,7 @@ def render_terms_of_service():
     This tool is intended solely for personal experimentation and development.
     By using this application, you agree that:
 
-    - You are providing your own Oura account access voluntarily
+    - You use your own data voluntarily
     - The authors of this tool are not responsible for incorrect or incomplete data
     - The tool is not a medical device
     - All data remains your property and is not stored outside your usage session
@@ -161,7 +155,7 @@ def parse_log_text(text: str):
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # 56 – HRV (heuristički)
+        # 56 – HRV (trenutno uzimamo 1 sample po liniji)
         if tokens[0] == "56":
             if len(tokens) >= 10:
                 try:
@@ -187,7 +181,7 @@ def parse_log_text(text: str):
                 pass
             i += 10
 
-        # 52 – steps (heuristika)
+        # 52 – steps (trenutno heuristika, 1 sample po liniji)
         j = 0
         n2 = len(tokens)
         while j + 9 < n2:
@@ -487,12 +481,74 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
 
     s = pd.Series(stages, index=df.index)
 
+    # Jednostavno "peglanje" izoliranih skokova
     s_smoothed = s.copy()
     for i in range(1, len(s) - 1):
         if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
             s_smoothed.iloc[i] = s.iloc[i - 1]
 
     return s_smoothed
+
+
+# =========================
+# Dijagnostika sampling-a
+# =========================
+
+def sampling_diagnostics(sleep_minutes, hr_samples, hrv_samples, step_samples):
+    st.subheader("Sampling diagnostics")
+
+    total_minutes = len(sleep_minutes)
+    st.write(f"Total minutes in sleep sessions: **{total_minutes}**")
+    st.write(
+        f"HR samples: **{len(hr_samples)}**, "
+        f"HRV samples: **{len(hrv_samples)}**, "
+        f"Step samples: **{len(step_samples)}**"
+    )
+
+    # HR gaps
+    if hr_samples:
+        hr_times = sorted(s.t for s in hr_samples)
+        dt_hr = [
+            (t2 - t1).total_seconds() / 60
+            for t1, t2 in zip(hr_times[:-1], hr_times[1:])
+        ]
+        s_hr = pd.Series(dt_hr)
+        st.write("**HR gaps (minutes):**")
+        st.write(
+            f"min={s_hr.min():.2f}, max={s_hr.max():.2f}, median={s_hr.median():.2f}"
+        )
+        st.write("Most common HR gaps (rounded):")
+        st.write(s_hr.round(1).value_counts().head(10))
+
+    # HRV gaps
+    if hrv_samples:
+        hrv_times = sorted(s.t for s in hrv_samples)
+        dt_hrv = [
+            (t2 - t1).total_seconds() / 60
+            for t1, t2 in zip(hrv_times[:-1], hrv_times[1:])
+        ]
+        s_hrv = pd.Series(dt_hrv)
+        st.write("**HRV gaps (minutes):**")
+        st.write(
+            f"min={s_hrv.min():.2f}, max={s_hrv.max():.2f}, median={s_hrv.median():.2f}"
+        )
+        st.write("Most common HRV gaps (rounded):")
+        st.write(s_hrv.round(1).value_counts().head(10))
+
+    # Step gaps
+    if step_samples:
+        step_times = sorted(s.t for s in step_samples)
+        dt_step = [
+            (t2 - t1).total_seconds() / 60
+            for t1, t2 in zip(step_times[:-1], step_times[1:])
+        ]
+        s_step = pd.Series(dt_step)
+        st.write("**Steps gaps (minutes):**")
+        st.write(
+            f"min={s_step.min():.2f}, max={s_step.max():.2f}, median={s_step.median():.2f}"
+        )
+        st.write("Most common Steps gaps (rounded):")
+        st.write(s_step.round(1).value_counts().head(10))
 
 
 # =========================
@@ -515,6 +571,7 @@ def rolla_app():
         st.error("No 53 packets (sleep data) found in this file.")
         return
 
+    # mapiranje uzoraka na minutni grid
     attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=10)
     attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=30)
     attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
@@ -522,6 +579,10 @@ def rolla_app():
     apply_device_stage(sleep_minutes)
     sessions = split_sessions(sleep_minutes, gap_min=30)
     sessions = sorted(sessions, key=lambda s: s[-1].t)
+
+    # Sampling dijagnostika
+    with st.expander("Sampling diagnostics"):
+        sampling_diagnostics(sleep_minutes, hr_samples, hrv_samples, step_samples)
 
     session_labels = []
     for i, sess in enumerate(sessions):
@@ -631,292 +692,6 @@ def rolla_app():
 
 
 # =========================
-# Oura helpers
-# =========================
-
-OURA_BASE = "https://api.ouraring.com/v2/usercollection"
-
-
-def get_oura_config():
-    client_id = st.secrets["OURA_CLIENT_ID"]
-    client_secret = st.secrets["OURA_CLIENT_SECRET"]
-    redirect_uri = st.secrets.get(
-        "OURA_REDIRECT_URI",
-        "https://sleepanalyzer-kglbkkvkpvkq9unhaatrpb.streamlit.app/oauth",
-    )
-    return client_id, client_secret, redirect_uri
-
-
-def fetch_oura_sleep(token: str, day: str):
-    """
-    Fetch Oura sleep for given calendar day (debug version).
-    Shows raw HTTP response if something is weird.
-    """
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {"start_date": day, "end_date": day}
-
-    # ---- 1) /sleep ----
-    r = requests.get(f"{OURA_BASE}/sleep", headers=headers, params=params)
-
-    # Debug: pokaži status + raw tekst
-    st.write("📡 /sleep status:", r.status_code)
-    try:
-        st.write("📡 /sleep raw body:", r.text[:2000])  # skraćeno, da ne bude predugačko
-    except Exception:
-        pass
-
-    if r.status_code != 200:
-        st.error(f"Oura /sleep HTTP {r.status_code}: {r.text}")
-        return None
-
-    try:
-        json_data = r.json()
-    except Exception as e:
-        st.error(f"Error parsing /sleep JSON: {e}")
-        return None
-
-    sleeps = json_data.get("data", [])
-    if sleeps:
-        # uzmi prvi zapis za taj dan
-        return sleeps[0]
-
-    # ---- 2) Ako nema ničega u /sleep, probaj /daily_sleep ----
-    r2 = requests.get(f"{OURA_BASE}/daily_sleep", headers=headers, params=params)
-
-    st.write("📡 /daily_sleep status:", r2.status_code)
-    try:
-        st.write("📡 /daily_sleep raw body:", r2.text[:2000])
-    except Exception:
-        pass
-
-    if r2.status_code != 200:
-        # ako je i ovo prazno – vratit ćemo None i gore će se ispisati upozorenje
-        return None
-
-    try:
-        json_data2 = r2.json()
-    except Exception:
-        return None
-
-    daily = json_data2.get("data", [])
-    if not daily:
-        return None
-
-    # /daily_sleep je već agregat za dan, pa ga samo vratimo
-    return daily[0]
-
-
-def fetch_oura_heartrate(token: str, start_iso: str, end_iso: str):
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {"start_datetime": start_iso, "end_datetime": end_iso}
-    r = requests.get(f"{OURA_BASE}/heartrate", headers=headers, params=params)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
-        return pd.DataFrame(columns=["time", "hr"])
-
-    rows = []
-    for row in data:
-        ts = row.get("timestamp")
-        hr = row.get("bpm")
-        if ts is None or hr is None:
-            continue
-        rows.append({"time": pd.to_datetime(ts), "hr": hr})
-
-    df = pd.DataFrame(rows).sort_values("time")
-    return df
-
-
-def summarize_oura_sleep(sleep_json: dict):
-    if sleep_json is None:
-        return None
-
-    start = pd.to_datetime(sleep_json.get("bedtime_start"))
-    end = pd.to_datetime(sleep_json.get("bedtime_end"))
-
-    total_sleep_sec = (
-        sleep_json.get("total_sleep_duration")
-        or sleep_json.get("duration")
-    )
-    rem_sec = sleep_json.get("rem_sleep_duration")
-    deep_sec = sleep_json.get("deep_sleep_duration")
-    light_sec = sleep_json.get("light_sleep_duration")
-    awake_sec = sleep_json.get("awake_time")
-
-    summary = {
-        "start": start,
-        "end": end,
-        "total_sleep_min": int(total_sleep_sec / 60) if total_sleep_sec else None,
-        "rem_min": int(rem_sec / 60) if rem_sec else None,
-        "deep_min": int(deep_sec / 60) if deep_sec else None,
-        "light_min": int(light_sec / 60) if light_sec else None,
-        "awake_min": int(awake_sec / 60) if awake_sec else None,
-    }
-
-    summary["hypnogram_raw"] = (
-        sleep_json.get("hypnogram_5min") or sleep_json.get("sleep_phase_5min")
-    )
-
-    return summary
-
-
-# =========================
-# Oura app (OAuth)
-# =========================
-
-def oura_app():
-    st.title("🛏️ Sleep Analyzer – Oura API (OAuth)")
-
-    # 1) Credentials
-    try:
-        client_id, client_secret, redirect_uri = get_oura_config()
-    except Exception:
-        st.error("Set OURA_CLIENT_ID, OURA_CLIENT_SECRET and OURA_REDIRECT_URI in Streamlit secrets.")
-        st.stop()
-
-    AUTH_URL = "https://cloud.ouraring.com/oauth/authorize"
-    TOKEN_URL = "https://api.ouraring.com/oauth/token"
-
-    # 2) Query parametri (code nakon povratka iz Oure)
-    #    (možeš kasnije prebaciti na st.query_params, ovo sada radi)
-    params = st.experimental_get_query_params()
-    code = params.get("code", [None])[0]
-
-    # Uzmemo eventualni token iz session_state (bez KeyError-a)
-    token = st.session_state.get("oura_token", None)
-
-    # 3) Ako NEMAMO token → moramo odraditi login / exchange
-    if not token:
-        # 3a) Imamo code u URL-u → manualni exchange
-        if code:
-            st.warning("Authorization code detected in URL. Manual exchange required.")
-
-            st.write("**Code:**", code)
-            st.write("**Redirect URI (from secrets):**", redirect_uri)
-            st.write("**Client ID (from secrets):**", client_id)
-            st.write(
-                "If this is an old/used code, it will fail. Use 'Connect Oura account' again to generate a new code."
-            )
-
-            if st.button("Exchange code for token now"):
-                data = {
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": redirect_uri,
-                }
-                try:
-                    r = requests.post(
-                        TOKEN_URL,
-                        data=data,
-                        auth=HTTPBasicAuth(client_id, client_secret),
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        timeout=15,
-                    )
-                except Exception as e:
-                    st.error(f"Network error calling token endpoint: {e}")
-                    st.stop()
-
-                st.write(f"HTTP {r.status_code} — response text:")
-                st.code(r.text)
-
-                if r.status_code != 200:
-                    st.error("Token exchange failed. See response above.")
-                    st.stop()
-
-                try:
-                    token_json = r.json()
-                except Exception:
-                    st.error(f"Cannot parse token JSON: {r.text}")
-                    st.stop()
-
-                access_token = token_json.get("access_token")
-                if not access_token:
-                    st.error(f"Token response missing access_token: {token_json}")
-                    st.stop()
-
-                # Spremimo token i očistimo ?code= iz URL-a
-                st.session_state["oura_token"] = access_token
-                st.experimental_set_query_params()
-                st.success("Oura account connected. You can now load sleep data.")
-            else:
-                st.info("Press the button to try exchanging code for token.")
-
-            # Zaustavi tu – čekamo da user napravi exchange
-            st.stop()
-
-        # 3b) NEMAMO ni token ni code → pokaži link za login
-        else:
-            scope = "email personal daily session heartrate sleep"
-            # (you can keep "session" too if želiš)
-            # scope = "email personal daily sleep session heartrate"
-            auth_params = {
-                "response_type": "code",
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "scope": scope,
-            }
-            auth_url = AUTH_URL + "?" + urllib.parse.urlencode(auth_params)
-
-            st.markdown(
-                """
-                1. Click the button below (opens in a new tab)  
-                2. Log into your Oura account and approve access  
-                3. You will be redirected back to this app (same URL)  
-                """
-            )
-
-            st.markdown(
-                f'<a href="{auth_url}" target="_blank"><button>🔗 Connect Oura account</button></a>',
-                unsafe_allow_html=True,
-            )
-            st.stop()
-
-    # 4) Ovdje SIGURNO imamo token u session_state
-    token = st.session_state["oura_token"]
-    st.info("Oura account connected. Pick a date to inspect sleep.")
-
-    day = st.date_input("Sleep date", value=date.today())
-
-    if st.button("Load Oura sleep"):
-        day_str = day.strftime("%Y-%m-%d")
-
-        # Sleep blok
-        try:
-            sleep_json = fetch_oura_sleep(token, day_str)
-        except Exception as e:
-            st.error(f"Error fetching sleep: {e}")
-            return
-
-        if sleep_json is None:
-            st.warning("No Oura sleep data found for that date.")
-            return
-
-        summary = summarize_oura_sleep(sleep_json)
-
-        st.subheader("Sleep summary (Oura)")
-        st.json(summary)
-
-        # Heart rate tijekom spavanja
-        start = summary["start"]
-        end = summary["end"]
-
-        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        try:
-            df_hr = fetch_oura_heartrate(token, start_iso, end_iso)
-        except Exception as e:
-            st.error(f"Error fetching heartrate: {e}")
-            return
-
-        if not df_hr.empty:
-            st.subheader("Heart rate during sleep (Oura)")
-            st.line_chart(df_hr.set_index("time")["hr"])
-        else:
-            st.info("No HR data returned from Oura for that interval.")
-
-
-# =========================
 # MAIN
 # =========================
 
@@ -933,15 +708,8 @@ def main():
         render_terms_of_service()
         return
 
-    app_mode = st.sidebar.selectbox(
-        "Data source",
-        ["Rolla band (BLE log)", "Oura API"],
-    )
-
-    if app_mode.startswith("Rolla"):
-        rolla_app()
-    else:
-        oura_app()
+    # za sada imamo samo Rolla izvor
+    rolla_app()
 
 
 if __name__ == "__main__":
