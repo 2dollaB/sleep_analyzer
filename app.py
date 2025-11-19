@@ -10,51 +10,47 @@ import streamlit as st
 
 
 # =========================
-# Privacy & Terms
+# Privacy & Terms (simple)
 # =========================
-
 def render_privacy_policy():
     st.title("Privacy Policy")
-    st.write("""
-    ### Sleep Analyzer – Privacy Policy
+    st.write(
+        """
+        ### Sleep Analyzer – Privacy Policy
 
-    This project is a development / testing tool used for personal analysis of sleep data.
-    We do not store, share or process any user data outside of this application.
+        This project is an internal tool used for personal analysis of sleep data.
+        We do not store, share or process any user data outside of this app.
+        Uploaded files are processed in-memory in your session and are not persisted
+        on any external server.
 
-    **What data is processed?**
-    - Sleep stages
-    - Heart rate data
-    - HRV values
+        **What data is processed?**
+        - Sleep staging packets (cmd 53)
+        - Heart rate samples (cmd 55)
+        - HRV samples (cmd 56)
+        - Steps (cmd 52)
 
-    **Where is the data stored?**  
-    - Only temporarily inside your browser session.
-    - No data is sent to third-party servers.
-
-    **Contact**: minarik.jan@rolla.app  
-    """)
+        **Contact**: minarik.jan@rolla.app
+        """
+    )
 
 
 def render_terms_of_service():
     st.title("Terms of Service")
-    st.write("""
-    ### Sleep Analyzer – Terms of Service
+    st.write(
+        """
+        ### Sleep Analyzer – Terms of Service
 
-    This tool is intended solely for personal experimentation and development.
-    By using this application, you agree that:
+        This tool is intended solely for development and experimentation.
+        It is **not** a medical device. Use at your own risk.
 
-    - You use your own data voluntarily
-    - The authors of this tool are not responsible for incorrect or incomplete data
-    - The tool is not a medical device
-    - All data remains your property and is not stored outside your usage session
-
-    For any questions, contact: minarik.jan@rolla.app
-    """)
+        For any questions, contact: minarik.jan@rolla.app
+        """
+    )
 
 
 # =========================
 # Helpers (BCD / datetime)
 # =========================
-
 def bcd_to_int(b: int) -> int:
     """Convert BCD-coded byte to int (0x24 -> 24, 0x11 -> 11)."""
     return (b >> 4) * 10 + (b & 0x0F)
@@ -85,12 +81,11 @@ def parse_device_datetime(tokens: List[str], idx: int) -> datetime:
 # =========================
 # Data classes
 # =========================
-
 @dataclass
 class SleepMinute:
     t: datetime
     raw_code: int
-    stage: str = "UNKNOWN"   # "device" stage
+    stage: str = "UNKNOWN"   # mapped device stage
     hr: Optional[int] = None
     hrv: Optional[int] = None
     steps: Optional[int] = None
@@ -117,7 +112,6 @@ class StepSample:
 # =========================
 # Parsing Rolla log (53 / 55 / 56 / 52)
 # =========================
-
 def parse_log_text(text: str):
     sleep_minutes: List[SleepMinute] = []
     hr_samples: List[HrSample] = []
@@ -135,8 +129,8 @@ def parse_log_text(text: str):
         if not tokens:
             continue
 
-        # 53 – sleep command
-        # Format: 53 idx 00 YY MM DD HH mm SS LEN S1..S120
+        # --- 53 – Sleep minute grid -----------------------------------------
+        # Format: 53 IDX 00 YY MM DD HH mm SS LEN S1..S120
         if tokens[0] == "53":
             if len(tokens) < 11:
                 continue
@@ -145,7 +139,11 @@ def parse_log_text(text: str):
             except Exception:
                 continue
 
-            length = int(tokens[9], 16)
+            try:
+                length = int(tokens[9], 16)
+            except Exception:
+                continue
+
             stage_bytes = tokens[10:10 + length]
             for i, sb in enumerate(stage_bytes):
                 try:
@@ -155,17 +153,24 @@ def parse_log_text(text: str):
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # 56 – HRV (trenutno uzimamo 1 sample po liniji)
+        # --- 56 – HRV / fatigue / BP (spec compliant) -----------------------
+        # 56 ID1 ID2 YY MM DD HH mm SS D1 D2 D3 D4 [D5 D6] ...
+        # D1 = HRV (1 byte)
         if tokens[0] == "56":
             if len(tokens) >= 10:
                 try:
-                    dt = parse_device_datetime(tokens, 3)
-                    hrv_val = int(tokens[9], 16)
-                    hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
+                    dt = parse_device_datetime(tokens, 3)   # YY MM DD HH mm SS (BCD)
+                    hrv_val = int(tokens[9], 16)            # D1 = HRV
+                    # Optional fields exist on some firmwares (not used yet):
+                    # fatigue = int(tokens[12], 16) if len(tokens) > 12 else None
+                    # sys_bp  = int(tokens[13], 16) if len(tokens) > 13 else None
+                    # dia_bp  = int(tokens[14], 16) if len(tokens) > 14 else None
+                    if 0 <= hrv_val <= 255:
+                        hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
                 except Exception:
                     pass
 
-        # 55 – HR: više paketa u jednoj liniji
+        # --- 55 – HR: može biti više paketa u jednoj liniji -----------------
         i = 0
         n = len(tokens)
         while i + 9 < n:
@@ -181,7 +186,7 @@ def parse_log_text(text: str):
                 pass
             i += 10
 
-        # 52 – steps (trenutno heuristika, 1 sample po liniji)
+        # --- 52 – steps (heuristika) ----------------------------------------
         j = 0
         n2 = len(tokens)
         while j + 9 < n2:
@@ -202,7 +207,6 @@ def parse_log_text(text: str):
 # =========================
 # Attach nearest HR / HRV / steps to minute grid
 # =========================
-
 def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min: float):
     if not samples or not minutes:
         return
@@ -230,9 +234,8 @@ def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min:
 
 
 # =========================
-# Split into sessions (prekid > X min = nova sesija)
+# Split into sessions (gap > X min = new session)
 # =========================
-
 def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
     if not minutes:
         return []
@@ -254,9 +257,8 @@ def split_sessions(minutes: List[SleepMinute], gap_min: float = 30.0):
 
 
 # =========================
-# Device stage mapping (53) – samo za usporedbu
+# Device stage mapping (53) – for comparison
 # =========================
-
 def code_to_stage(code: int) -> str:
     if code == 0x01:
         return "DEEP"
@@ -275,7 +277,6 @@ def apply_device_stage(minutes: List[SleepMinute]):
 # =========================
 # DataFrame helpers
 # =========================
-
 def build_dataframe(session: List[SleepMinute]) -> pd.DataFrame:
     df = pd.DataFrame(
         {
@@ -303,7 +304,6 @@ def format_hm(minutes: int) -> str:
 # =========================
 # Plotly hypnogram
 # =========================
-
 def build_hypnogram_figure(df: pd.DataFrame):
     if df.empty:
         return None
@@ -356,9 +356,8 @@ def build_hypnogram_figure(df: pd.DataFrame):
 
 
 # =========================
-# HR graf iz HR sampleova
+# HR line from samples
 # =========================
-
 def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=None):
     if not samples:
         return None
@@ -375,7 +374,6 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
         return None
 
     df_hr = pd.DataFrame(rows).sort_values("time")
-
     fig = px.line(df_hr, x="time", y="hr")
     fig.update_layout(
         xaxis_title="Time of night",
@@ -387,9 +385,8 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
 
 # =========================
-# Custom algoritam v3
+# Custom staging (v3 – same as before)
 # =========================
-
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     df = df.copy()
 
@@ -481,7 +478,7 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
 
     s = pd.Series(stages, index=df.index)
 
-    # Jednostavno "peglanje" izoliranih skokova
+    # 1-minute spike smoother
     s_smoothed = s.copy()
     for i in range(1, len(s) - 1):
         if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
@@ -491,74 +488,34 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
 
 
 # =========================
-# Dijagnostika sampling-a
+# Debug helpers
 # =========================
-
-def sampling_diagnostics(sleep_minutes, hr_samples, hrv_samples, step_samples):
-    st.subheader("Sampling diagnostics")
-
-    total_minutes = len(sleep_minutes)
-    st.write(f"Total minutes in sleep sessions: **{total_minutes}**")
-    st.write(
-        f"HR samples: **{len(hr_samples)}**, "
-        f"HRV samples: **{len(hrv_samples)}**, "
-        f"Step samples: **{len(step_samples)}**"
+def debug_gaps(samples, name, start_t, end_t):
+    ts = sorted([s.t for s in samples if start_t <= s.t <= end_t])
+    if len(ts) < 2:
+        st.info(f"Not enough {name} points in selected range.")
+        return
+    gaps = [(ts[i] - ts[i - 1]).total_seconds() / 60 for i in range(1, len(ts))]
+    st.markdown(
+        f"**{name} gaps (minutes)**: "
+        f"min={min(gaps):.2f}, median={pd.Series(gaps).median():.2f}, max={max(gaps):.2f}"
     )
-
-    # HR gaps
-    if hr_samples:
-        hr_times = sorted(s.t for s in hr_samples)
-        dt_hr = [
-            (t2 - t1).total_seconds() / 60
-            for t1, t2 in zip(hr_times[:-1], hr_times[1:])
-        ]
-        s_hr = pd.Series(dt_hr)
-        st.write("**HR gaps (minutes):**")
-        st.write(
-            f"min={s_hr.min():.2f}, max={s_hr.max():.2f}, median={s_hr.median():.2f}"
-        )
-        st.write("Most common HR gaps (rounded):")
-        st.write(s_hr.round(1).value_counts().head(10))
-
-    # HRV gaps
-    if hrv_samples:
-        hrv_times = sorted(s.t for s in hrv_samples)
-        dt_hrv = [
-            (t2 - t1).total_seconds() / 60
-            for t1, t2 in zip(hrv_times[:-1], hrv_times[1:])
-        ]
-        s_hrv = pd.Series(dt_hrv)
-        st.write("**HRV gaps (minutes):**")
-        st.write(
-            f"min={s_hrv.min():.2f}, max={s_hrv.max():.2f}, median={s_hrv.median():.2f}"
-        )
-        st.write("Most common HRV gaps (rounded):")
-        st.write(s_hrv.round(1).value_counts().head(10))
-
-    # Step gaps
-    if step_samples:
-        step_times = sorted(s.t for s in step_samples)
-        dt_step = [
-            (t2 - t1).total_seconds() / 60
-            for t1, t2 in zip(step_times[:-1], step_times[1:])
-        ]
-        s_step = pd.Series(dt_step)
-        st.write("**Steps gaps (minutes):**")
-        st.write(
-            f"min={s_step.min():.2f}, max={s_step.max():.2f}, median={s_step.median():.2f}"
-        )
-        st.write("Most common Steps gaps (rounded):")
-        st.write(s_step.round(1).value_counts().head(10))
+    st.dataframe(
+        pd.Series([round(g, 1) for g in gaps], name="gap_min")
+        .value_counts()
+        .sort_index()
+        .to_frame("count")
+    )
 
 
 # =========================
 # Rolla app (BLE)
 # =========================
-
 def rolla_app():
     st.title("🛏️ Sleep Analyzer – Rolla band")
 
     uploaded = st.file_uploader("Upload Rolla BLE sleep log (.txt)", type=["txt"])
+    st.caption("Supported commands in the log: 53 (sleep), 55 (HR), 56 (HRV), 52 (steps).")
 
     if not uploaded:
         st.info("Upload a BLE log file to analyze sleep.")
@@ -571,18 +528,14 @@ def rolla_app():
         st.error("No 53 packets (sleep data) found in this file.")
         return
 
-    # mapiranje uzoraka na minutni grid
-    attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=10)
-    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=30)
+    # attach with realistic tolerances
+    attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=5)    # HR ~ every 2 min
+    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=15) # HRV ~ every 10 min
     attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
 
     apply_device_stage(sleep_minutes)
     sessions = split_sessions(sleep_minutes, gap_min=30)
     sessions = sorted(sessions, key=lambda s: s[-1].t)
-
-    # Sampling dijagnostika
-    with st.expander("Sampling diagnostics"):
-        sampling_diagnostics(sleep_minutes, hr_samples, hrv_samples, step_samples)
 
     session_labels = []
     for i, sess in enumerate(sessions):
@@ -594,7 +547,7 @@ def rolla_app():
         )
 
     st.sidebar.header("Session")
-    default_index = max(0, len(sessions) - 1)
+    default_index = max(0, len(sessions) - 1)  # pick the latest by default
     selected_idx = st.sidebar.selectbox(
         "Choose sleep session",
         range(len(sessions)),
@@ -647,6 +600,11 @@ def rolla_app():
     )
     df_stage = df_stage[df_stage["stage"].isin(selected_stages)]
 
+    # --- Diagnostics --------------------------------------------------------
+    with st.expander("Signal sanity checks (session range)"):
+        debug_gaps(hr_samples, "HR", start_t, end_t)
+        debug_gaps(hrv_samples, "HRV", start_t, end_t)
+
     if df_stage.empty:
         st.warning("No data in selected time/stage range.")
         st.markdown("### Heart rate")
@@ -694,13 +652,12 @@ def rolla_app():
 # =========================
 # MAIN
 # =========================
-
 def main():
     st.set_page_config(page_title="Sleep Analyzer", layout="wide")
 
-    # routing za privacy/terms
-    params = st.experimental_get_query_params()
-    path = params.get("path", [None])[0]
+    # Optional simple routing for privacy/terms:
+    params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+    path = params.get("path", [None])[0] if isinstance(params.get("path", None), list) else params.get("path", None)
     if path == "privacy":
         render_privacy_policy()
         return
@@ -708,7 +665,6 @@ def main():
         render_terms_of_service()
         return
 
-    # za sada imamo samo Rolla izvor
     rolla_app()
 
 
