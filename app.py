@@ -101,6 +101,9 @@ class HrSample:
 class HrvSample:
     t: datetime
     hrv: int
+    fatigue: Optional[int] = None
+    id1: Optional[int] = None
+    id2: Optional[int] = None
 
 
 @dataclass
@@ -153,27 +156,37 @@ def parse_log_text(text: str):
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # --- 56 – HRV / fatigue / BP (spec compliant) -----------------------
-        # 56 ID1 ID2 YY MM DD HH mm SS D1 D2 D3 D4 [D5 D6] ...
-        # D1 = HRV (1 byte)
-        if tokens[0] == "56":
-            if len(tokens) >= 10:
-                try:
-                    dt = parse_device_datetime(tokens, 3)   # YY MM DD HH mm SS (BCD)
-                    hrv_val = int(tokens[9], 16)            # D1 = HRV
-                    # Optional fields (not used, ali ostavljamo kao reference):
-                    # fatigue = int(tokens[12], 16) if len(tokens) > 12 else None  # D4
-                    # sys_bp  = int(tokens[13], 16) if len(tokens) > 13 else None  # D5
-                    # dia_bp  = int(tokens[14], 16) if len(tokens) > 14 else None  # D6
-                    if 0 <= hrv_val <= 255:
-                        hrv_samples.append(HrvSample(t=dt, hrv=hrv_val))
-                except Exception:
-                    pass
-
-        # --- 55 – HR: može biti više paketa u jednoj liniji -----------------
-        i = 0
+        # --- 56 – HRV / fatigue / BP (spec-robust) --------------------------
+        # 56 ID1 ID2 YY MM DD HH mm SS D1 D2 D3 D4 CRC1 CRC2  (15 tokena)
+        # D1 = HRV, D4 = fatigue
+        k = 0
         n = len(tokens)
-        while i + 9 < n:
+        while k + 14 < n:
+            if tokens[k] != "56":
+                k += 1
+                continue
+            try:
+                id1 = int(tokens[k + 1], 16)
+                id2 = int(tokens[k + 2], 16)
+                dt = parse_device_datetime(tokens, k + 3)  # YY..SS in BCD
+
+                d1 = int(tokens[k + 9], 16)   # HRV
+                # d2 = int(tokens[k+10], 16)  # n/e
+                # d3 = int(tokens[k+11], 16)  # n/e
+                d4 = int(tokens[k + 12], 16)  # fatigue
+
+                if 0 <= d1 <= 255:
+                    hrv_samples.append(
+                        HrvSample(t=dt, hrv=d1, fatigue=d4, id1=id1, id2=id2)
+                    )
+            except Exception:
+                pass
+            k += 15  # preskoči na idući potencijalni 56 frame
+
+        # --- 55 – HR: više paketa u jednoj liniji ---------------------------
+        i = 0
+        n55 = len(tokens)
+        while i + 9 < n55:
             if tokens[i] != "55":
                 i += 1
                 continue
@@ -188,8 +201,8 @@ def parse_log_text(text: str):
 
         # --- 52 – steps (heuristika) ----------------------------------------
         j = 0
-        n2 = len(tokens)
-        while j + 9 < n2:
+        n52 = len(tokens)
+        while j + 9 < n52:
             if tokens[j] != "52":
                 j += 1
                 continue
@@ -200,6 +213,16 @@ def parse_log_text(text: str):
             except Exception:
                 pass
             j += 10
+
+    # Dedup HRV zapisa (ako je više frameova s istim TS-om, zadrži zadnji)
+    hrv_samples.sort(key=lambda s: s.t)
+    dedup = []
+    for s in hrv_samples:
+        if dedup and abs((s.t - dedup[-1].t).total_seconds()) < 60:
+            dedup[-1] = s
+        else:
+            dedup.append(s)
+    hrv_samples = dedup
 
     return sleep_minutes, hr_samples, hrv_samples, step_samples
 
@@ -385,7 +408,7 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
 
 # =========================
-# Custom staging (v3 – same rules as dosad)
+# Custom staging (v3 – ista pravila)
 # =========================
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     df = df.copy()
@@ -654,8 +677,8 @@ def rolla_app():
         return
 
     # attach with realistic tolerances
-    attach_nearest(hr_samples, sleep_minutes, "hr", max_diff_min=5)     # HR ~ every 2 min
-    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=15)  # HRV ~ every 10 min
+    attach_nearest(hr_samples, sleep_minutes, "hr",  max_diff_min=5)     # HR ~ svake 2 min
+    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=15)   # HRV ~ svakih 10 min
     attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
 
     apply_device_stage(sleep_minutes)
@@ -806,8 +829,13 @@ def main():
     st.set_page_config(page_title="Sleep Analyzer", layout="wide")
 
     # Optional simple routing for privacy/terms:
-    params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
-    path = params.get("path", [None])[0] if isinstance(params.get("path", None), list) else params.get("path", None)
+    params = getattr(st, "query_params", None)
+    if params is None:
+        params = st.experimental_get_query_params()
+        path = params.get("path", [None])[0] if isinstance(params.get("path", None), list) else params.get("path", None)
+    else:
+        path = params.get("path", None)
+
     if path == "privacy":
         render_privacy_policy()
         return
