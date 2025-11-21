@@ -7,6 +7,20 @@ from typing import List, Optional, Dict
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import re
+
+
+# =========================
+# Tunables (easy to tweak)
+# =========================
+HR_ATTACH_TOL_MIN = 5          # HR ~ every 2 min
+HRV_ATTACH_TOL_MIN = 12        # HRV ~ every 10 min, allow ±12 min nearest attach
+STEPS_ATTACH_TOL_MIN = 5
+
+HRV_FILL_LIMIT_MIN = 6         # per direction limit for ffill/bfill on the minute grid
+AWAKE_STEP_DELTA = 1           # >=1 step in the minute → awake
+AWAKE_HR_Z = 1.2               # HR z-score threshold for awake spikes
+SMOOTH_SPIKE = True            # 1-min ABA spike smoothing
 
 
 # =========================
@@ -115,6 +129,9 @@ class StepSample:
 # =========================
 # Parsing Rolla log (53 / 55 / 56 / 52)
 # =========================
+FRAME56 = re.compile(r"\b56(?: [0-9A-F]{2}){14}\b")  # 56 + 14 bytes
+
+
 def parse_log_text(text: str):
     sleep_minutes: List[SleepMinute] = []
     hr_samples: List[HrSample] = []
@@ -139,10 +156,6 @@ def parse_log_text(text: str):
                 continue
             try:
                 start_dt = parse_device_datetime(tokens, 3)
-            except Exception:
-                continue
-
-            try:
                 length = int(tokens[9], 16)
             except Exception:
                 continue
@@ -156,32 +169,37 @@ def parse_log_text(text: str):
                 minute_dt = start_dt + timedelta(minutes=i)
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
-        # --- 56 – HRV / fatigue / BP (spec-robust) --------------------------
-        # 56 ID1 ID2 YY MM DD HH mm SS D1 D2 D3 D4 CRC1 CRC2  (15 tokena)
-        # D1 = HRV, D4 = fatigue
-        k = 0
-        n = len(tokens)
-        while k + 14 < n:
-            if tokens[k] != "56":
-                k += 1
-                continue
-            try:
-                id1 = int(tokens[k + 1], 16)
-                id2 = int(tokens[k + 2], 16)
-                dt = parse_device_datetime(tokens, k + 3)  # YY..SS in BCD
+        # --- 56 – HRV / fatigue / BP (regex-robust) -------------------------
+        if "56" in tokens:
+            # Search frames in the raw payload string to be resilient to odd spacing
+            for m in FRAME56.finditer(payload):
+                parts = m.group(0).split()
+                # parts[0] == "56"
+                try:
+                    id1 = int(parts[1], 16)
+                    id2 = int(parts[2], 16)
+                    # YY MM DD HH mm SS
+                    yy = int(parts[3], 16); mm = int(parts[4], 16); dd = int(parts[5], 16)
+                    hh = int(parts[6], 16); mi = int(parts[7], 16); ss = int(parts[8], 16)
+                    d1 = int(parts[9], 16)   # HRV
+                    # d2 = int(parts[10],16) # unused
+                    # d3 = int(parts[11],16) # unused
+                    d4 = int(parts[12], 16)  # fatigue
+                except Exception:
+                    continue
 
-                d1 = int(tokens[k + 9], 16)   # HRV
-                # d2 = int(tokens[k+10], 16)  # n/e
-                # d3 = int(tokens[k+11], 16)  # n/e
-                d4 = int(tokens[k + 12], 16)  # fatigue
+                try:
+                    dt = datetime(2000 + bcd_to_int(yy),
+                                  bcd_to_int(mm),
+                                  bcd_to_int(dd),
+                                  bcd_to_int(hh),
+                                  bcd_to_int(mi),
+                                  bcd_to_int(ss))
+                except Exception:
+                    continue
 
                 if 0 <= d1 <= 255:
-                    hrv_samples.append(
-                        HrvSample(t=dt, hrv=d1, fatigue=d4, id1=id1, id2=id2)
-                    )
-            except Exception:
-                pass
-            k += 15  # preskoči na idući potencijalni 56 frame
+                    hrv_samples.append(HrvSample(t=dt, hrv=d1, fatigue=d4, id1=id1, id2=id2))
 
         # --- 55 – HR: više paketa u jednoj liniji ---------------------------
         i = 0
@@ -228,32 +246,25 @@ def parse_log_text(text: str):
 
 
 # =========================
-# Attach nearest HR / HRV / steps to minute grid
+# Fast attach via merge_asof
 # =========================
-def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min: float):
+def attach_nearest_fast(samples, minutes: List[SleepMinute], attr: str, max_diff_min: float):
     if not samples or not minutes:
         return
+    s_times = [s.t for s in samples]
+    s_vals = [getattr(s, attr) for s in samples]
+    s_df = pd.DataFrame({"time": s_times, attr: s_vals}).sort_values("time")
+    m_df = pd.DataFrame({"time": [m.t for m in minutes]}).sort_values("time")
 
-    samples = sorted(samples, key=lambda s: s.t)
-
-    def nearest_value(t: datetime):
-        best = None
-        best_diff = None
-        for s in samples:
-            diff = abs((s.t - t).total_seconds())
-            if best_diff is None or diff < best_diff:
-                best = s
-                best_diff = diff
-        if best is None:
-            return None
-        if best_diff <= max_diff_min * 60:
-            return getattr(best, attr)
-        return None
-
-    for m in minutes:
-        val = nearest_value(m.t)
-        if val is not None:
-            setattr(m, attr, val)
+    merged = pd.merge_asof(
+        m_df, s_df, on="time",
+        direction="nearest",
+        tolerance=pd.Timedelta(minutes=max_diff_min)
+    )
+    # Write back
+    for m, val in zip(minutes, merged[attr].tolist()):
+        if pd.notna(val):
+            setattr(m, attr, int(val))
 
 
 # =========================
@@ -408,40 +419,55 @@ def build_hr_figure_from_samples(samples: List[HrSample], start_t=None, end_t=No
 
 
 # =========================
-# Custom staging (v3 – ista pravila)
+# Custom staging (v3 with must-fix changes)
 # =========================
 def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
     df = df.copy()
 
+    # HR series
     if df["hr"].notna().sum() < 5:
         return df["stage"].fillna("LIGHT")
 
-    hr_s = df["hr"].astype("float").interpolate(limit_direction="both")
+    hr_s = pd.to_numeric(df["hr"], errors="coerce").interpolate(limit_direction="both")
     hr_s = hr_s.rolling(5, min_periods=1, center=True).mean()
-
-    hrv_s = df["hrv"].astype("float")
-    if hrv_s.notna().sum() > 5:
-        hrv_s = hrv_s.interpolate(limit_direction="both")
-        hrv_s = hrv_s.rolling(5, min_periods=1, center=True).mean()
-    else:
-        hrv_s = None
-
-    steps_s = df["steps"].fillna(0)
     hr_diff = hr_s.diff().abs().rolling(3, min_periods=1).mean()
 
-    hr_low = hr_s.quantile(0.25)
-    hr_high = hr_s.quantile(0.75)
-    hr_very_high = hr_s.quantile(0.90)
+    # HR z-score for awake spikes (global)
+    sigma = float(hr_s.std(ddof=0)) or 1.0
+    mu = float(hr_s.mean())
+    hr_z = (hr_s - mu) / sigma
 
-    if hrv_s is not None:
-        hrv_low = hrv_s.quantile(0.25)
-        hrv_high = hrv_s.quantile(0.75)
+    # HRV with limited fill (avoid bridging long gaps)
+    hrv_raw = pd.to_numeric(df["hrv"], errors="coerce")
+    hrv_ffill = hrv_raw.fillna(method="ffill", limit=HRV_FILL_LIMIT_MIN)
+    hrv_bfill = hrv_raw.fillna(method="bfill", limit=HRV_FILL_LIMIT_MIN)
+    hrv_s = hrv_ffill.where(hrv_raw.notna(), hrv_bfill)
+    hrv_s = hrv_s.rolling(5, min_periods=1, center=True).mean()
+
+    # Steps → use delta (cumulative → movement in this minute)
+    steps_raw = pd.to_numeric(df["steps"], errors="coerce").fillna(0)
+    step_delta = steps_raw.diff().clip(lower=0).fillna(0)
+    moved = step_delta >= AWAKE_STEP_DELTA
+
+    # Adaptive thresholds (quantiles) – computed on coarse-sleep mask to avoid awake contamination
+    coarse_sleep_mask = ~(moved | (hr_z >= (AWAKE_HR_Z + 0.3)))
+    hr_for_q = hr_s[coarse_sleep_mask] if coarse_sleep_mask.any() else hr_s
+
+    hr_low = float(hr_for_q.quantile(0.25))
+    hr_high = float(hr_for_q.quantile(0.75))
+    hr_very_high = float(hr_for_q.quantile(0.90))
+
+    diff_low = float(hr_diff.quantile(0.25))
+    diff_high = float(hr_diff.quantile(0.75))
+
+    # HRV quantiles on available samples only
+    if hrv_s.notna().sum() >= 5:
+        hrv_low = float(hrv_s.quantile(0.25))
+        hrv_high = float(hrv_s.quantile(0.75))
     else:
         hrv_low = hrv_high = None
 
-    diff_low = hr_diff.quantile(0.25)
-    diff_high = hr_diff.quantile(0.75)
-
+    # Time fraction in the night
     t_start = df["time"].min()
     t_end = df["time"].max()
     total_sec = max(1.0, (t_end - t_start).total_seconds())
@@ -452,62 +478,64 @@ def compute_custom_stage(df: pd.DataFrame) -> pd.Series:
         t = row["time"]
         hr_val = hr_s.loc[idx]
         diff_val = hr_diff.loc[idx]
-        hrv_val = hrv_s.loc[idx] if hrv_s is not None else None
-        steps_val = steps_s.loc[idx]
+        hrv_val = hrv_s.loc[idx] if pd.notna(hrv_s.loc[idx]) else None
         frac = (t - t_start).total_seconds() / total_sec
 
-        stage = "LIGHT"
-
-        # Awake
-        if steps_val and steps_val > 0:
-            stage = "AWAKE"
-            stages.append(stage)
+        # 1) Awake rules
+        if moved.loc[idx]:
+            stages.append("AWAKE")
+            continue
+        # z-score awake spikes anywhere in the night (not only edges)
+        if (hr_z.loc[idx] >= AWAKE_HR_Z) and (diff_val >= diff_high):
+            stages.append("AWAKE")
+            continue
+        # additional edge-boost (keep)
+        if (hr_val >= hr_very_high) and (diff_val >= diff_high) and (frac < 0.1 or frac > 0.9):
+            stages.append("AWAKE")
             continue
 
-        if hr_val >= hr_very_high and diff_val >= diff_high and (frac < 0.1 or frac > 0.9):
-            stage = "AWAKE"
-            stages.append(stage)
-            continue
-
+        # 2) Sleep scoring
         deep_score = 0
         rem_score = 0
 
+        # Deep features
         if hr_val <= hr_low:
             deep_score += 2
         if diff_val <= diff_low:
             deep_score += 1
-        if hrv_high is not None and hrv_val is not None and hrv_val >= hrv_high:
+        if (hrv_high is not None) and (hrv_val is not None) and (hrv_val >= hrv_high):
             deep_score += 2
-        if frac < 0.4:
+        if frac < 0.40:
             deep_score += 1
 
+        # REM features
         if hr_val >= hr_high:
             rem_score += 2
         if diff_val >= diff_high:
             rem_score += 1
-        if hrv_low is not None and hrv_val is not None and hrv_val <= hrv_low:
+        if (hrv_low is not None) and (hrv_val is not None) and (hrv_val <= hrv_low):
             rem_score += 2
-        if frac > 0.3:
+        if frac > 0.30:
             rem_score += 1
 
         if deep_score >= 3 and deep_score > rem_score:
-            stage = "DEEP"
+            stages.append("DEEP")
         elif rem_score >= 3 and rem_score > deep_score:
-            stage = "REM"
+            stages.append("REM")
         else:
-            stage = "LIGHT"
-
-        stages.append(stage)
+            stages.append("LIGHT")
 
     s = pd.Series(stages, index=df.index)
 
-    # 1-minute spike smoother
-    s_smoothed = s.copy()
-    for i in range(1, len(s) - 1):
-        if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
-            s_smoothed.iloc[i] = s.iloc[i - 1]
+    # Optional 1-minute spike smoother (A–B–A -> A)
+    if SMOOTH_SPIKE and len(s) >= 3:
+        s_smoothed = s.copy()
+        for i in range(1, len(s) - 1):
+            if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
+                s_smoothed.iloc[i] = s.iloc[i - 1]
+        return s_smoothed
 
-    return s_smoothed
+    return s
 
 
 # =========================
@@ -676,10 +704,10 @@ def rolla_app():
         st.error("No 53 packets (sleep data) found in this file.")
         return
 
-    # attach with realistic tolerances
-    attach_nearest(hr_samples, sleep_minutes, "hr",  max_diff_min=5)     # HR ~ svake 2 min
-    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=15)   # HRV ~ svakih 10 min
-    attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=5)
+    # Fast nearest attach with tolerances
+    attach_nearest_fast(hr_samples,  sleep_minutes, "hr",    max_diff_min=HR_ATTACH_TOL_MIN)
+    attach_nearest_fast(hrv_samples, sleep_minutes, "hrv",   max_diff_min=HRV_ATTACH_TOL_MIN)
+    attach_nearest_fast(step_samples, sleep_minutes, "steps", max_diff_min=STEPS_ATTACH_TOL_MIN)
 
     apply_device_stage(sleep_minutes)
     sessions = split_sessions(sleep_minutes, gap_min=30)
