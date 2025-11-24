@@ -19,8 +19,20 @@ STEPS_ATTACH_TOL_MIN = 5    # nearest Steps sample tolerance
 HRV_FILL_LIMIT_MIN = 6      # limited ffill/bfill window for HRV (in minutes)
 
 AWAKE_STEP_DELTA = 1        # per-minute steps delta to mark Awake
-AWAKE_HR_Z = 1.2            # z-score threshold for HR spikes
+AWAKE_HR_Z = 1.2            # z-score threshold for HR spikes (v1)
 SMOOTH_SPIKE = True         # 1-min spike smoothing for stages
+
+
+# =========================
+# Tunables for v2 staging
+# =========================
+DEEP_MIN_BOUT_MIN = 5       # minimum continuous minutes to keep as DEEP
+REM_MIN_BOUT_MIN = 5        # minimum continuous minutes to keep as REM
+
+DEEP_EARLY_FRAC = 0.5       # DEEP more likely in first 50% of night
+REM_LATE_FRAC = 0.3         # REM more likely after first 30% of night
+
+AWAKE_HR_Z_V2 = 1.5         # stricter HR spike threshold for AWAKE (v2)
 
 
 # =========================
@@ -373,7 +385,7 @@ def build_hypnogram_figure(df: pd.DataFrame):
 
 
 # =========================
-# Custom staging (v3, custom-only)
+# Custom staging (v1, existing logic)
 # =========================
 def compute_custom_stage(df_in: pd.DataFrame) -> pd.Series:
     df = df_in.copy()
@@ -512,6 +524,216 @@ def compute_custom_stage(df_in: pd.DataFrame) -> pd.Series:
 
 
 # =========================
+# Custom staging (v2, experimental)
+# =========================
+def compute_custom_stage_v2(df_in: pd.DataFrame) -> pd.Series:
+    """
+    Experimental v2 staging:
+    - Uses HR relative to a slow baseline (~30 min)
+    - Uses HR volatility and HRV as slower trends
+    - Adds time-of-night bias (early = more DEEP, late = more REM)
+    - Enforces minimum DEEP/REM bout length
+    """
+    df = df_in.copy()
+
+    # If we have almost no HR, bail out
+    if df["hr"].notna().sum() < 5:
+        return pd.Series(["LIGHT"] * len(df), index=df.index)
+
+    # ----- HR preprocessing -----
+    hr = df["hr"].astype(float).interpolate(limit_direction="both")
+    # Short-term smoothing
+    hr_short = hr.rolling(5, min_periods=1, center=True).mean()
+
+    # Slow baseline over ~30 minutes (assuming 1-min grid)
+    hr_baseline = hr.rolling(31, min_periods=15, center=True).median()
+    if hr_baseline.isna().all():
+        hr_baseline = pd.Series(hr.median(), index=df.index)
+    else:
+        hr_baseline = hr_baseline.fillna(hr.median())
+
+    # HR relative to baseline
+    hr_rel = hr_short - hr_baseline
+
+    # Z-scores for HR relative change
+    hr_rel_mu = hr_rel.mean()
+    hr_rel_sigma = hr_rel.std(ddof=0) or 1.0
+    hr_rel_z = (hr_rel - hr_rel_mu) / hr_rel_sigma
+
+    # HR volatility (short-term variability)
+    hr_diff = hr_short.diff().abs().rolling(5, min_periods=1).mean()
+
+    # ----- HRV preprocessing (slow trend) -----
+    hrv = df["hrv"].astype(float)
+    if hrv.notna().sum() > 5:
+        # conservative filling
+        hrv = hrv.ffill(limit=HRV_FILL_LIMIT_MIN).bfill(limit=HRV_FILL_LIMIT_MIN)
+        # slow trend over ~30 minutes
+        hrv_slow = hrv.rolling(31, min_periods=5, center=True).mean()
+        if hrv_slow.notna().sum() > 5:
+            hrv_mu = hrv_slow.mean()
+            hrv_sigma = hrv_slow.std(ddof=0) or 1.0
+            hrv_z = (hrv_slow - hrv_mu) / hrv_sigma
+        else:
+            hrv_slow = None
+            hrv_z = None
+    else:
+        hrv_slow = None
+        hrv_z = None
+
+    # ----- Steps: cumulative → per-minute delta -----
+    steps_cum = df["steps"].copy()
+    steps_cum = steps_cum.ffill()
+    step_delta = steps_cum.diff().fillna(0).clip(lower=0)
+
+    # ----- Global thresholds (quantiles) -----
+    def safe_q(s, qv):
+        s_valid = s.dropna()
+        if s_valid.empty:
+            return None
+        return float(s_valid.quantile(qv))
+
+    hr_diff_q50 = safe_q(hr_diff, 0.50)
+    hr_diff_q75 = safe_q(hr_diff, 0.75)
+    hr_diff_q25 = safe_q(hr_diff, 0.25)
+
+    hr_rel_z_q25 = safe_q(hr_rel_z, 0.25)
+    hr_rel_z_q75 = safe_q(hr_rel_z, 0.75)
+
+    if hrv_z is not None:
+        hrv_z_q25 = safe_q(hrv_z, 0.25)
+        hrv_z_q75 = safe_q(hrv_z, 0.75)
+    else:
+        hrv_z_q25 = hrv_z_q75 = None
+
+    # ----- Time-of-night fraction -----
+    t_start = df["time"].min()
+    t_end = df["time"].max()
+    total_sec = max(1.0, (t_end - t_start).total_seconds())
+
+    # ----- First pass: assign raw stages -----
+    raw_stages = []
+
+    for idx in df.index:
+        t = df.loc[idx, "time"]
+        frac = (t - t_start).total_seconds() / total_sec
+
+        hrz_val = hr_rel_z.loc[idx]
+        hrz = 0.0 if pd.isna(hrz_val) else hrz_val
+
+        diff_val = hr_diff.loc[idx]
+        diff_val = 0.0 if pd.isna(diff_val) else diff_val
+
+        steps_d = step_delta.loc[idx]
+        steps_d = 0.0 if pd.isna(steps_d) else steps_d
+
+        if hrv_z is not None and idx in hrv_z.index:
+            hrvz_val = hrv_z.loc[idx]
+            hrvz = None if pd.isna(hrvz_val) else hrvz_val
+        else:
+            hrvz = None
+
+        # -------- AWAKE detection (more conservative than v1) --------
+        is_awake = False
+
+        # Obvious movement
+        if steps_d >= AWAKE_STEP_DELTA:
+            is_awake = True
+
+        # HR spike + high volatility
+        if (
+            not is_awake
+            and hr_diff_q75 is not None
+            and hrz >= AWAKE_HR_Z_V2
+            and diff_val >= hr_diff_q75
+        ):
+            is_awake = True
+
+        # Edge boost: start/end 10% of night
+        if (
+            not is_awake
+            and hr_diff_q75 is not None
+            and hr_rel_z_q75 is not None
+            and (frac < 0.10 or frac > 0.90)
+            and hrz >= hr_rel_z_q75
+            and diff_val >= hr_diff_q75
+        ):
+            is_awake = True
+
+        if is_awake:
+            raw_stages.append("AWAKE")
+            continue
+
+        # -------- Sleep stages: DEEP vs REM vs LIGHT --------
+        deep_score = 0
+        rem_score = 0
+
+        # DEEP: low HR relative baseline, low volatility, high HRV
+        if hr_rel_z_q25 is not None and hrz <= hr_rel_z_q25:
+            deep_score += 2
+        if hr_diff_q25 is not None and diff_val <= hr_diff_q25:
+            deep_score += 1
+        if hrv_z_q75 is not None and hrvz is not None and hrvz >= hrv_z_q75:
+            deep_score += 2
+        # Early-night bias
+        if frac <= DEEP_EARLY_FRAC:
+            deep_score += 1
+
+        # REM: higher HR rel baseline, moderate volatility, lower HRV, later in night
+        if hr_rel_z_q75 is not None and hrz >= hr_rel_z_q75:
+            rem_score += 2
+        if hr_diff_q50 is not None and diff_val >= hr_diff_q50:
+            rem_score += 1
+        if hrv_z_q25 is not None and hrvz is not None and hrvz <= hrv_z_q25:
+            rem_score += 2
+        # Late-night bias
+        if frac >= REM_LATE_FRAC:
+            rem_score += 1
+
+        if deep_score >= 3 and deep_score > rem_score:
+            raw_stages.append("DEEP")
+        elif rem_score >= 3 and rem_score > deep_score:
+            raw_stages.append("REM")
+        else:
+            raw_stages.append("LIGHT")
+
+    s = pd.Series(raw_stages, index=df.index)
+
+    # ----- Smoothing step 1: remove single-minute spikes -----
+    if SMOOTH_SPIKE and len(s) >= 3:
+        s2 = s.copy()
+        for i in range(1, len(s) - 1):
+            if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
+                s2.iloc[i] = s.iloc[i - 1]
+        s = s2
+
+    # ----- Smoothing step 2: enforce minimum bout duration for DEEP/REM -----
+    def enforce_min_bout(series: pd.Series, stage: str, min_len: int) -> pd.Series:
+        arr = series.values.copy()
+        n = len(arr)
+        i = 0
+        while i < n:
+            if arr[i] != stage:
+                i += 1
+                continue
+            start = i
+            while i < n and arr[i] == stage:
+                i += 1
+            end = i  # [start, end)
+            length = end - start
+            if length < min_len:
+                # convert short bouts to LIGHT
+                for j in range(start, end):
+                    arr[j] = "LIGHT"
+        return pd.Series(arr, index=series.index)
+
+    s = enforce_min_bout(s, "DEEP", DEEP_MIN_BOUT_MIN)
+    s = enforce_min_bout(s, "REM", REM_MIN_BOUT_MIN)
+
+    return s
+
+
+# =========================
 # Diagnostics
 # =========================
 def hrv_diagnostics_from_samples(samples: List[HrvSample], title: str):
@@ -604,9 +826,21 @@ def rolla_app():
     )
     session = sessions[selected_idx]
 
-    # Build DataFrame and compute CUSTOM ONLY stages
+    # Build DataFrame
     df_full = build_dataframe(session)
-    df_full["stage"] = compute_custom_stage(df_full)  # <-- custom only
+
+    # Choose staging method
+    st.sidebar.header("Staging method")
+    staging_method = st.sidebar.radio(
+        "Choose algorithm",
+        options=["v1 (current)", "v2 (experimental)"],
+        index=0,
+    )
+
+    if staging_method.startswith("v1"):
+        df_full["stage"] = compute_custom_stage(df_full)
+    else:
+        df_full["stage"] = compute_custom_stage_v2(df_full)
 
     # Sidebar counts
     st.sidebar.caption(
