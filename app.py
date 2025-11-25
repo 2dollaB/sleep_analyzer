@@ -385,6 +385,17 @@ def build_hypnogram_figure(df: pd.DataFrame):
 
 
 # =========================
+# Steps helper (fix): cumulative → per-minute, robust to object dtype
+# =========================
+def safe_step_delta(steps_col: pd.Series) -> pd.Series:
+    s = pd.to_numeric(steps_col, errors="coerce")  # ensure numeric
+    s = s.ffill()                                   # keep last known cumulative
+    delta = s.diff()                                 # per-minute increments
+    delta = delta.where(delta >= 0, 0)               # no negatives (device resets)
+    return delta.fillna(0)
+
+
+# =========================
 # Custom staging (v1, existing logic)
 # =========================
 def compute_custom_stage(df_in: pd.DataFrame) -> pd.Series:
@@ -406,11 +417,8 @@ def compute_custom_stage(df_in: pd.DataFrame) -> pd.Series:
     else:
         hrv_s = None
 
-    # --- Steps: convert cumulative → per-minute delta ---
-    steps_cum = df["steps"].copy()
-    # When steps are missing, forward fill to keep last known cumulative, then diff
-    steps_cum = steps_cum.ffill()
-    step_delta = steps_cum.diff().fillna(0).clip(lower=0)  # per-minute increments
+    # --- Steps: cumulative → per-minute delta (robust) ---
+    step_delta = safe_step_delta(df["steps"])
 
     # --- HR variability (minute-to-minute absolute diff) ---
     hr_diff = hr_s.diff().abs().rolling(3, min_periods=1).mean()
@@ -581,10 +589,8 @@ def compute_custom_stage_v2(df_in: pd.DataFrame) -> pd.Series:
         hrv_slow = None
         hrv_z = None
 
-    # ----- Steps: cumulative → per-minute delta -----
-    steps_cum = df["steps"].copy()
-    steps_cum = steps_cum.ffill()
-    step_delta = steps_cum.diff().fillna(0).clip(lower=0)
+    # ----- Steps: cumulative → per-minute delta (robust) -----
+    step_delta = safe_step_delta(df["steps"])
 
     # ----- Global thresholds (quantiles) -----
     def safe_q(s, qv):
@@ -722,7 +728,6 @@ def compute_custom_stage_v2(df_in: pd.DataFrame) -> pd.Series:
             end = i  # [start, end)
             length = end - start
             if length < min_len:
-                # convert short bouts to LIGHT
                 for j in range(start, end):
                     arr[j] = "LIGHT"
         return pd.Series(arr, index=series.index)
