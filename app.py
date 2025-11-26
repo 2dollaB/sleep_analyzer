@@ -19,12 +19,11 @@ STEPS_ATTACH_TOL_MIN = 5    # nearest Steps sample tolerance
 HRV_FILL_LIMIT_MIN = 6      # limited ffill/bfill window for HRV (in minutes)
 
 AWAKE_STEP_DELTA = 1        # per-minute steps delta to mark Awake
-AWAKE_HR_Z = 1.2            # z-score threshold for HR spikes (v1)
 SMOOTH_SPIKE = True         # 1-min spike smoothing for stages
 
 
 # =========================
-# Tunables for v2 staging
+# Tunables for v2 staging (UNCHANGED)
 # =========================
 DEEP_MIN_BOUT_MIN = 5       # minimum continuous minutes to keep as DEEP
 REM_MIN_BOUT_MIN = 5        # minimum continuous minutes to keep as REM
@@ -184,7 +183,7 @@ def parse_log_text(text: str):
                 sleep_minutes.append(SleepMinute(t=minute_dt, raw_code=code))
 
         # --- 56 – HRV / fatigue / BP (spec-robust) --------------------------
-        # 56 ID1 ID2 YY MM DD HH mm SS D1 D2 D3 D4 CRC1 CRC2  (15 tokena)
+        # 56 ID1 ID2 YY MM DD HH mm SS D1 D2 D3 D4 CRC1 CRC2  (15 tokens)
         # D1 = HRV, D4 = fatigue
         k = 0
         n = len(tokens)
@@ -272,7 +271,7 @@ def attach_nearest(samples, minutes: List[SleepMinute], attr: str, max_diff_min:
         if best is None:
             return None
         if best_diff <= max_diff_min * 60:
-            return getattr(best, attr)
+            return getattr(s, attr) if (s := best) else None
         return None
 
     for m in minutes:
@@ -385,154 +384,7 @@ def build_hypnogram_figure(df: pd.DataFrame):
 
 
 # =========================
-# Steps helper (fix): cumulative → per-minute, robust to object dtype
-# =========================
-def safe_step_delta(steps_col: pd.Series) -> pd.Series:
-    s = pd.to_numeric(steps_col, errors="coerce")  # ensure numeric
-    s = s.ffill()                                   # keep last known cumulative
-    delta = s.diff()                                 # per-minute increments
-    delta = delta.where(delta >= 0, 0)               # no negatives (device resets)
-    return delta.fillna(0)
-
-
-# =========================
-# Custom staging (v1, existing logic)
-# =========================
-def compute_custom_stage(df_in: pd.DataFrame) -> pd.Series:
-    df = df_in.copy()
-
-    # We need some HR for staging; otherwise fallback to LIGHT
-    if df["hr"].notna().sum() < 5:
-        return pd.Series(["LIGHT"] * len(df), index=df.index)
-
-    # --- HR preprocessing ---
-    hr_s = df["hr"].astype("float").interpolate(limit_direction="both")
-    hr_s = hr_s.rolling(5, min_periods=1, center=True).mean()
-
-    # --- HRV preprocessing (limited fills to avoid fabricating long trends) ---
-    hrv_s = df["hrv"].astype("float")
-    if hrv_s.notna().sum() > 5:
-        hrv_s = hrv_s.ffill(limit=HRV_FILL_LIMIT_MIN).bfill(limit=HRV_FILL_LIMIT_MIN)
-        hrv_s = hrv_s.rolling(5, min_periods=1, center=True).mean()
-    else:
-        hrv_s = None
-
-    # --- Steps: cumulative → per-minute delta (robust) ---
-    step_delta = safe_step_delta(df["steps"])
-
-    # --- HR variability (minute-to-minute absolute diff) ---
-    hr_diff = hr_s.diff().abs().rolling(3, min_periods=1).mean()
-
-    # --- Global stats & thresholds ---
-    # Build a coarse sleep mask (exclude movement & big spikes) to reduce awake contamination
-    hr_mu = hr_s.mean()
-    hr_sigma = hr_s.std(ddof=0) if hr_s.std(ddof=0) > 0 else 1.0
-    hr_z = (hr_s - hr_mu) / hr_sigma
-
-    awake_like = (step_delta >= AWAKE_STEP_DELTA) | (hr_z >= AWAKE_HR_Z)
-    sleep_mask = (~awake_like)
-
-    # Quantiles computed over sleep_mask if possible
-    def q(s, qv):
-        try:
-            return float(s.quantile(qv))
-        except Exception:
-            return float(s.dropna().quantile(qv)) if s.dropna().size else None
-
-    if sleep_mask.sum() >= 10:
-        hr_q25 = q(hr_s[sleep_mask], 0.25)
-        hr_q75 = q(hr_s[sleep_mask], 0.75)
-        hr_q90 = q(hr_s[sleep_mask], 0.90)
-        diff_q25 = q(hr_diff[sleep_mask], 0.25)
-        diff_q75 = q(hr_diff[sleep_mask], 0.75)
-        if hrv_s is not None and hrv_s.notna().sum() > 5:
-            hrv_q25 = q(hrv_s[sleep_mask], 0.25)
-            hrv_q75 = q(hrv_s[sleep_mask], 0.75)
-        else:
-            hrv_q25 = hrv_q75 = None
-    else:
-        hr_q25 = q(hr_s, 0.25)
-        hr_q75 = q(hr_s, 0.75)
-        hr_q90 = q(hr_s, 0.90)
-        diff_q25 = q(hr_diff, 0.25)
-        diff_q75 = q(hr_diff, 0.75)
-        if hrv_s is not None and hrv_s.notna().sum() > 5:
-            hrv_q25 = q(hrv_s, 0.25)
-            hrv_q75 = q(hrv_s, 0.75)
-        else:
-            hrv_q25 = hrv_q75 = None
-
-    t_start = df["time"].min()
-    t_end = df["time"].max()
-    total_sec = max(1.0, (t_end - t_start).total_seconds())
-
-    stages = []
-
-    for idx, _ in df.iterrows():
-        t = df.loc[idx, "time"]
-        hr_val = hr_s.loc[idx]
-        diff_val = hr_diff.loc[idx]
-        hrv_val = hrv_s.loc[idx] if hrv_s is not None else None
-        steps_d = step_delta.loc[idx]
-        hrz = hr_z.loc[idx]
-        frac = (t - t_start).total_seconds() / total_sec
-
-        # --- Awake detection ---
-        if steps_d >= AWAKE_STEP_DELTA:
-            stages.append("AWAKE")
-            continue
-        if (hrz >= AWAKE_HR_Z) and (diff_q75 is not None) and (diff_val >= diff_q75):
-            stages.append("AWAKE")
-            continue
-        # Edge boost (start/end 10% of night)
-        if hr_q90 is not None and diff_q75 is not None:
-            if (frac < 0.10 or frac > 0.90) and (hr_val >= hr_q90) and (diff_val >= diff_q75):
-                stages.append("AWAKE")
-                continue
-
-        # --- Sleep scoring ---
-        deep_score = 0
-        rem_score = 0
-
-        if hr_q25 is not None and hr_val <= hr_q25:
-            deep_score += 2
-        if diff_q25 is not None and diff_val <= diff_q25:
-            deep_score += 1
-        if hrv_q75 is not None and hrv_val is not None and hrv_val >= hrv_q75:
-            deep_score += 2
-        if frac < 0.40:
-            deep_score += 1
-
-        if hr_q75 is not None and hr_val >= hr_q75:
-            rem_score += 2
-        if diff_q75 is not None and diff_val >= diff_q75:
-            rem_score += 1
-        if hrv_q25 is not None and hrv_val is not None and hrv_val <= hrv_q25:
-            rem_score += 2
-        if frac > 0.30:
-            rem_score += 1
-
-        if deep_score >= 3 and deep_score > rem_score:
-            stages.append("DEEP")
-        elif rem_score >= 3 and rem_score > deep_score:
-            stages.append("REM")
-        else:
-            stages.append("LIGHT")
-
-    s = pd.Series(stages, index=df.index)
-
-    if SMOOTH_SPIKE and len(s) >= 3:
-        s2 = s.copy()
-        for i in range(1, len(s) - 1):
-            if s.iloc[i] != s.iloc[i - 1] and s.iloc[i] != s.iloc[i + 1]:
-                s2.iloc[i] = s.iloc[i - 1]
-        s = s2
-
-    return s
-
-
-# =========================
-# Custom staging (v2, experimental)
+# Custom staging (v2, experimental) — UNCHANGED
 # =========================
 def compute_custom_stage_v2(df_in: pd.DataFrame) -> pd.Series:
     """
@@ -589,8 +441,10 @@ def compute_custom_stage_v2(df_in: pd.DataFrame) -> pd.Series:
         hrv_slow = None
         hrv_z = None
 
-    # ----- Steps: cumulative → per-minute delta (robust) -----
-    step_delta = safe_step_delta(df["steps"])
+    # ----- Steps: cumulative → per-minute delta -----
+    steps_cum = df["steps"].copy()
+    steps_cum = steps_cum.ffill()
+    step_delta = steps_cum.diff().fillna(0).clip(lower=0)
 
     # ----- Global thresholds (quantiles) -----
     def safe_q(s, qv):
@@ -728,6 +582,7 @@ def compute_custom_stage_v2(df_in: pd.DataFrame) -> pd.Series:
             end = i  # [start, end)
             length = end - start
             if length < min_len:
+                # convert short bouts to LIGHT
                 for j in range(start, end):
                     arr[j] = "LIGHT"
         return pd.Series(arr, index=series.index)
@@ -783,129 +638,151 @@ def hrv_diagnostics_from_samples(samples: List[HrvSample], title: str):
 
 
 # =========================
-# Rolla app (BLE) – CUSTOM ONLY
+# Rolla app (BLE) – CUSTOM V2 ONLY
 # =========================
 def rolla_app():
-    st.title("🛏️ Sleep Analyzer — Custom Stages (HR + HRV + Steps)")
+    st.title("🛏️ Sleep Analyzer — Custom Stages (V2 only)")
 
     uploaded = st.file_uploader("Upload Rolla BLE sleep log (.txt)", type=["txt"])
-    st.caption("We use 53 only for time grid (start/end). Staging is 100% custom from 55/56/52.")
+    st.caption("We use 53 only for time grid (start/end). Staging is 100% custom from 55/56/52 (V2).")
 
     if not uploaded:
         st.info("Upload a BLE log file to analyze sleep.")
-        return
-
-    text = uploaded.read().decode("utf-8", errors="ignore")
-    sleep_minutes, hr_samples, hrv_samples, step_samples = parse_log_text(text)
-
-    if not sleep_minutes:
-        st.error("No 53 packets (sleep time grid) found in this file.")
-        return
-
-    # Attach signals to minute grid
-    attach_nearest(hr_samples, sleep_minutes, "hr",  max_diff_min=HR_ATTACH_TOL_MIN)
-    attach_nearest(hrv_samples, sleep_minutes, "hrv", max_diff_min=HRV_ATTACH_TOL_MIN)
-    attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=STEPS_ATTACH_TOL_MIN)
-
-    # Sessions (by gaps in the minute grid)
-    sessions = split_sessions(sleep_minutes, gap_min=30)
-    sessions = sorted(sessions, key=lambda s: s[-1].t)  # latest first in UI
-
-    # Sidebar: choose session (default last)
-    session_labels = []
-    for i, sess in enumerate(sessions):
-        df_tmp = build_dataframe(sess)
-        s_start = df_tmp["time"].min()
-        s_end = df_tmp["time"].max()
-        session_labels.append(
-            f"Session {i + 1}  ({s_start.strftime('%Y-%m-%d %H:%M')} – {s_end.strftime('%H:%M')})"
-        )
-
-    st.sidebar.header("Session")
-    default_index = max(0, len(sessions) - 1)  # default to latest
-    selected_idx = st.sidebar.selectbox(
-        "Choose sleep session",
-        range(len(sessions)),
-        index=default_index,
-        format_func=lambda i: session_labels[i],
-    )
-    session = sessions[selected_idx]
-
-    # Build DataFrame
-    df_full = build_dataframe(session)
-
-    # Choose staging method
-    st.sidebar.header("Staging method")
-    staging_method = st.sidebar.radio(
-        "Choose algorithm",
-        options=["v1 (current)", "v2 (experimental)"],
-        index=0,
-    )
-
-    if staging_method.startswith("v1"):
-        df_full["stage"] = compute_custom_stage(df_full)
     else:
+        text = uploaded.read().decode("utf-8", errors="ignore")
+        sleep_minutes, hr_samples, hrv_samples, step_samples = parse_log_text(text)
+
+        if not sleep_minutes:
+            st.error("No 53 packets (sleep time grid) found in this file.")
+            return
+
+        # Attach signals to minute grid
+        attach_nearest(hr_samples,   sleep_minutes, "hr",    max_diff_min=HR_ATTACH_TOL_MIN)
+        attach_nearest(hrv_samples,  sleep_minutes, "hrv",   max_diff_min=HRV_ATTACH_TOL_MIN)
+        attach_nearest(step_samples, sleep_minutes, "steps", max_diff_min=STEPS_ATTACH_TOL_MIN)
+
+        # Sessions (by gaps in the minute grid)
+        sessions = split_sessions(sleep_minutes, gap_min=30)
+        sessions = sorted(sessions, key=lambda s: s[-1].t)  # latest last for labels; we default to latest
+
+        # Sidebar: choose session (default last)
+        session_labels = []
+        for i, sess in enumerate(sessions):
+            df_tmp = build_dataframe(sess)
+            s_start = df_tmp["time"].min()
+            s_end = df_tmp["time"].max()
+            session_labels.append(
+                f"Session {i + 1}  ({s_start.strftime('%Y-%m-%d %H:%M')} – {s_end.strftime('%H:%M')})"
+            )
+
+        st.sidebar.header("Session")
+        default_index = max(0, len(sessions) - 1)  # default to latest
+        selected_idx = st.sidebar.selectbox(
+            "Choose sleep session",
+            range(len(sessions)),
+            index=default_index,
+            format_func=lambda i: session_labels[i],
+        )
+        session = sessions[selected_idx]
+
+        # Build DataFrame
+        df_full = build_dataframe(session)
+
+        # ---- V2 STAGING ONLY ----
         df_full["stage"] = compute_custom_stage_v2(df_full)
 
-    # Sidebar counts
-    st.sidebar.caption(
-        f"HR samples: {len(hr_samples)} | HRV samples: {len(hrv_samples)} | Step samples: {len(step_samples)}"
-    )
+        # Sidebar counts
+        st.sidebar.caption(
+            f"HR samples: {len(hr_samples)} | HRV samples: {len(hrv_samples)} | Step samples: {len(step_samples)}"
+        )
 
-    # Time filter
-    min_t, max_t = df_full["time"].min(), df_full["time"].max()
-    total_minutes = max(1, int((max_t - min_t).total_seconds() / 60))
+        # Time filter
+        min_t, max_t = df_full["time"].min(), df_full["time"].max()
+        total_minutes = max(1, int((max_t - min_t).total_seconds() / 60))
 
-    st.sidebar.header("Time filter")
-    start_min, end_min = st.sidebar.slider(
-        "Visible time range (minutes from start)",
-        min_value=0,
-        max_value=total_minutes,
-        value=(0, total_minutes),
-    )
-    start_t = min_t + timedelta(minutes=start_min)
-    end_t = min_t + timedelta(minutes=end_min)
+        st.sidebar.header("Time filter")
+        start_min, end_min = st.sidebar.slider(
+            "Visible time range (minutes from start)",
+            min_value=0,
+            max_value=total_minutes,
+            value=(0, total_minutes),
+        )
+        start_t = min_t + timedelta(minutes=start_min)
+        end_t = min_t + timedelta(minutes=end_min)
 
-    df_view = df_full[(df_full["time"] >= start_t) & (df_full["time"] <= end_t)].copy()
+        df_view = df_full[(df_full["time"] >= start_t) & (df_full["time"] <= end_t)].copy()
 
-    # Stage filter
-    st.sidebar.header("Stages (custom)")
-    all_stages = ["AWAKE", "REM", "LIGHT", "DEEP"]
-    selected_stages = st.sidebar.multiselect(
-        "Show stages",
-        options=all_stages,
-        default=all_stages,
-    )
-    df_stage = df_view[df_view["stage"].isin(selected_stages)]
+        # Stage filter
+        st.sidebar.header("Stages (custom V2)")
+        all_stages = ["AWAKE", "REM", "LIGHT", "DEEP"]
+        selected_stages = st.sidebar.multiselect(
+            "Show stages",
+            options=all_stages,
+            default=all_stages,
+        )
+        df_stage = df_view[df_view["stage"].isin(selected_stages)]
 
-    # Diagnostics
-    with st.expander("Signal sanity checks (session range)"):
-        # HR gaps
-        ts_hr = sorted([s.t for s in hr_samples if start_t <= s.t <= end_t])
-        if len(ts_hr) >= 2:
-            gaps_hr = pd.Series(ts_hr).diff().dt.total_seconds().div(60.0).iloc[1:]
-            st.write(
-                f"**HR gaps (min)** — min={gaps_hr.min():.2f}, median={gaps_hr.median():.2f}, max={gaps_hr.max():.2f}"
-            )
+        # Diagnostics
+        with st.expander("Signal sanity checks (session range)"):
+            # HR gaps
+            ts_hr = sorted([s.t for s in hr_samples if start_t <= s.t <= end_t])
+            if len(ts_hr) >= 2:
+                gaps_hr = pd.Series(ts_hr).diff().dt.total_seconds().div(60.0).iloc[1:]
+                st.write(
+                    f"**HR gaps (min)** — min={gaps_hr.min():.2f}, median={gaps_hr.median():.2f}, max={gaps_hr.max():.2f}"
+                )
+            else:
+                st.info("Not enough HR points in selected range.")
+
+            # HRV gaps
+            ts_hrv = sorted([s.t for s in hrv_samples if start_t <= s.t <= end_t])
+            if len(ts_hrv) >= 2:
+                gaps_hrv = pd.Series(ts_hrv).diff().dt.total_seconds().div(60.0).iloc[1:]
+                st.write(
+                    f"**HRV gaps (min)** — min={gaps_hrv.min():.2f}, median={gaps_hrv.median():.2f}, max={gaps_hrv.max():.2f}"
+                )
+            else:
+                st.info("Not enough HRV points in selected range.")
+
+        with st.expander("HRV detailed diagnostics (BLE log)"):
+            hrv_diagnostics_from_samples(hrv_samples, "BLE HRV samples")
+
+        # If no stage rows visible, still show HR graph
+        if df_stage.empty:
+            st.warning("No data in selected time/stage range.")
+            st.markdown("### Heart rate")
+            hr_rows = [{"time": s.t, "hr": s.hr} for s in hr_samples if start_t <= s.t <= end_t]
+            if hr_rows:
+                st.plotly_chart(px.line(pd.DataFrame(hr_rows).sort_values("time"), x="time", y="hr"),
+                                use_container_width=True)
+            else:
+                st.info("No HR data available for this session.")
+            return
+
+        # Top metrics
+        start = df_stage["time"].min()
+        end = df_stage["time"].max() + timedelta(minutes=1)
+        total_min = int((end - start).total_seconds() / 60)
+
+        stage_counts = summarize_stages(df_stage)
+
+        c1, c2 = st.columns(2)
+        c1.metric("Sleep window (visible)", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
+        c2.metric("Duration (visible)", format_hm(total_min))
+
+        st.markdown("### Stage durations (filtered) — Custom V2")
+        cols = st.columns(len(selected_stages))
+        for col, stg in zip(cols, selected_stages):
+            mins = stage_counts.get(stg, 0)
+            col.metric(stg, format_hm(mins))
+
+        st.markdown("### Hypnogram (Custom V2)")
+        hypno_fig = build_hypnogram_figure(df_stage[["time", "stage"]])
+        if hypno_fig is not None:
+            st.plotly_chart(hypno_fig, use_container_width=True)
         else:
-            st.info("Not enough HR points in selected range.")
+            st.info("Not enough data to draw hypnogram.")
 
-        # HRV gaps
-        ts_hrv = sorted([s.t for s in hrv_samples if start_t <= s.t <= end_t])
-        if len(ts_hrv) >= 2:
-            gaps_hrv = pd.Series(ts_hrv).diff().dt.total_seconds().div(60.0).iloc[1:]
-            st.write(
-                f"**HRV gaps (min)** — min={gaps_hrv.min():.2f}, median={gaps_hrv.median():.2f}, max={gaps_hrv.max():.2f}"
-            )
-        else:
-            st.info("Not enough HRV points in selected range.")
-
-    with st.expander("HRV detailed diagnostics (BLE log)"):
-        hrv_diagnostics_from_samples(hrv_samples, "BLE HRV samples")
-
-    # If no stage rows visible, still show HR graph
-    if df_stage.empty:
-        st.warning("No data in selected time/stage range.")
         st.markdown("### Heart rate")
         hr_rows = [{"time": s.t, "hr": s.hr} for s in hr_samples if start_t <= s.t <= end_t]
         if hr_rows:
@@ -913,49 +790,16 @@ def rolla_app():
                             use_container_width=True)
         else:
             st.info("No HR data available for this session.")
-        return
 
-    # Top metrics
-    start = df_stage["time"].min()
-    end = df_stage["time"].max() + timedelta(minutes=1)
-    total_min = int((end - start).total_seconds() / 60)
-
-    stage_counts = summarize_stages(df_stage)
-
-    c1, c2 = st.columns(2)
-    c1.metric("Sleep window (visible)", f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
-    c2.metric("Duration (visible)", format_hm(total_min))
-
-    st.markdown("### Stage durations (filtered) — Custom only")
-    cols = st.columns(len(selected_stages))
-    for col, stg in zip(cols, selected_stages):
-        mins = stage_counts.get(stg, 0)
-        col.metric(stg, format_hm(mins))
-
-    st.markdown("### Hypnogram (Custom)")
-    hypno_fig = build_hypnogram_figure(df_stage[["time", "stage"]])
-    if hypno_fig is not None:
-        st.plotly_chart(hypno_fig, use_container_width=True)
-    else:
-        st.info("Not enough data to draw hypnogram.")
-
-    st.markdown("### Heart rate")
-    hr_rows = [{"time": s.t, "hr": s.hr} for s in hr_samples if start_t <= s.t <= end_t]
-    if hr_rows:
-        st.plotly_chart(px.line(pd.DataFrame(hr_rows).sort_values("time"), x="time", y="hr"),
-                        use_container_width=True)
-    else:
-        st.info("No HR data available for this session.")
-
-    with st.expander("Debug table (per minute)"):
-        st.dataframe(df_view.reset_index(drop=True))
+        with st.expander("Debug table (per minute)"):
+            st.dataframe(df_view.reset_index(drop=True))
 
 
 # =========================
 # MAIN
 # =========================
 def main():
-    st.set_page_config(page_title="Sleep Analyzer", layout="wide")
+    st.set_page_config(page_title="Sleep Analyzer (V2 only)", layout="wide")
 
     # Optional routing for privacy/terms:
     params = getattr(st, "query_params", None)
