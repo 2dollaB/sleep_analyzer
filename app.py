@@ -441,10 +441,19 @@ def compute_custom_stage_v2(df_in: pd.DataFrame) -> pd.Series:
         hrv_slow = None
         hrv_z = None
 
-    # ----- Steps: cumulative → per-minute delta -----
-    steps_cum = df["steps"].copy()
+# ----- Steps: cumulative → per-minute delta (robust) -----
+# Convert to numeric, keep NaN for anything non-numeric, then handle gracefully
+steps_raw = df["steps"]
+steps_cum = pd.to_numeric(steps_raw, errors="coerce")
+
+if steps_cum.notna().sum() == 0:
+    # No usable steps at all → treat as zero movement
+    step_delta = pd.Series(0.0, index=df.index)
+else:
+    # Forward-fill cumulative counter, then diff; clamp negatives to 0 (counter resets)
     steps_cum = steps_cum.ffill()
-    step_delta = steps_cum.diff().fillna(0).clip(lower=0)
+    step_delta = steps_cum.diff()
+    step_delta = step_delta.where(step_delta >= 0, 0).fillna(0.0)
 
     # ----- Global thresholds (quantiles) -----
     def safe_q(s, qv):
